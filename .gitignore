@@ -24,3 +24,9 @@ Thumbs.db
 # Local configuration
 local.properties
 CODE_REVIEW.md
+
+# Docker
+.dockerignore
+
+# K8s secrets (contains credentials)
+k8s/secret.yaml
