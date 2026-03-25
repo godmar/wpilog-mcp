@@ -3,11 +3,11 @@ package org.triplehelix.wpilogmcp.tools;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import java.io.IOException;
 import java.util.Comparator;
 import org.triplehelix.wpilogmcp.log.LogDirectory;
 import org.triplehelix.wpilogmcp.log.EntryInfo;
-import org.triplehelix.wpilogmcp.mcp.McpServer;
+import org.triplehelix.wpilogmcp.log.LogData;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
 import org.triplehelix.wpilogmcp.mcp.McpServer.SchemaBuilder;
 import org.triplehelix.wpilogmcp.mcp.McpServer.Tool;
 import org.triplehelix.wpilogmcp.tba.TbaClient;
@@ -16,19 +16,18 @@ import org.triplehelix.wpilogmcp.tba.TbaEnrichment;
 import static org.triplehelix.wpilogmcp.tools.ToolUtils.*;
 
 /**
- * Core WPILOG tools for log management and basic operations.
+ * Core WPILOG tools for log discovery and data access.
  *
  * <p>Tools included:
  * <ul>
  *   <li>{@code list_available_logs} - Browse logs in the configured directory</li>
- *   <li>{@code load_log} - Load a WPILOG file for analysis</li>
- *   <li>{@code list_entries} - List all entries in the active log</li>
+ *   <li>{@code list_entries} - List all entries in a log file</li>
  *   <li>{@code get_entry_info} - Get detailed info about a specific entry</li>
  *   <li>{@code read_entry} - Read values from an entry with pagination</li>
- *   <li>{@code list_loaded_logs} - List all loaded logs and cache status</li>
- *   <li>{@code set_active_log} - Switch between loaded logs</li>
- *   <li>{@code unload_log} - Unload a specific log</li>
- *   <li>{@code unload_all_logs} - Clear the log cache</li>
+ *   <li>{@code list_loaded_logs} - Show cache status</li>
+ *   <li>{@code list_struct_types} - List supported struct types</li>
+ *   <li>{@code health_check} - Server status and diagnostics</li>
+ *   <li>{@code get_game_info} - Year-specific FRC game data</li>
  * </ul>
  */
 public final class CoreTools {
@@ -38,18 +37,15 @@ public final class CoreTools {
   /**
    * Registers all core tools with the MCP server.
    */
-  public static void registerAll(McpServer server) {
-    server.registerTool(new ListAvailableLogsTool());
-    server.registerTool(new LoadLogTool());
-    server.registerTool(new ListEntriesTool());
-    server.registerTool(new GetEntryInfoTool());
-    server.registerTool(new ReadEntryTool());
-    server.registerTool(new ListLoadedLogsTool());
-    server.registerTool(new SetActiveLogTool());
-    server.registerTool(new UnloadLogTool());
-    server.registerTool(new UnloadAllLogsTool());
-    server.registerTool(new ListStructTypesTool());
-    server.registerTool(new HealthCheckTool());
+  public static void registerAll(ToolRegistry registry) {
+    registry.registerTool(new ListAvailableLogsTool());
+    registry.registerTool(new ListEntriesTool());
+    registry.registerTool(new GetEntryInfoTool());
+    registry.registerTool(new ReadEntryTool());
+    registry.registerTool(new ListLoadedLogsTool());
+    registry.registerTool(new ListStructTypesTool());
+    registry.registerTool(new HealthCheckTool());
+    registry.registerTool(new GetGameInfoTool());
   }
 
   static class ListAvailableLogsTool implements Tool {
@@ -60,7 +56,11 @@ public final class CoreTools {
 
     @Override
     public String description() {
-      return "List WPILOG files available in the configured log directory with friendly names.";
+      return "List WPILOG files available in the configured log directory with friendly names. "
+          + "IMPORTANT: When TBA is configured, this tool automatically enriches each log with "
+          + "match data including alliance scores, win/loss results, and actual match times. "
+          + "Check the 'tba' field in each log entry for match outcomes—don't guess from telemetry! "
+          + "Use this tool first to find logs and get match results, then pass the path to other tools.";
     }
 
     @Override
@@ -122,60 +122,7 @@ public final class CoreTools {
     }
   }
 
-  static class LoadLogTool implements Tool {
-    @Override
-    public String name() {
-      return "load_log";
-    }
-
-    @Override
-    public String description() {
-      return "Load a WPILOG file for analysis. Returns summary info about the log.";
-    }
-
-    @Override
-    public JsonObject inputSchema() {
-      return new SchemaBuilder()
-          .addProperty("path", "string", "Path to the WPILOG file", true)
-          .build();
-    }
-
-    @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      if (!arguments.has("path") || arguments.get("path").isJsonNull()) {
-        return errorResult("Missing required parameter: path");
-      }
-      var path = arguments.get("path").getAsString();
-      if (path.isEmpty()) {
-        return errorResult("Parameter 'path' cannot be empty");
-      }
-      try {
-        var log = getLogManager().loadLog(path);
-
-        var result = new JsonObject();
-        result.addProperty("success", true);
-        result.addProperty("path", log.path());
-        result.addProperty("entry_count", log.entryCount());
-
-        var timeRange = new JsonObject();
-        timeRange.addProperty("start", log.minTimestamp());
-        timeRange.addProperty("end", log.maxTimestamp());
-        timeRange.addProperty("duration", log.duration());
-        result.add("time_range_sec", timeRange);
-
-        if (log.truncated()) {
-          result.addProperty("truncated", true);
-          result.addProperty("warning", log.truncationMessage());
-        }
-
-        return result;
-      } catch (IOException e) {
-        return errorResult("Failed to load log file: " + e.getMessage());
-      }
-    }
-  }
-
-  static class ListEntriesTool implements Tool {
+  static class ListEntriesTool extends LogRequiringTool {
     @Override
     public String name() {
       return "list_entries";
@@ -183,26 +130,26 @@ public final class CoreTools {
 
     @Override
     public String description() {
-      return "List all entries in the currently loaded log file. Optionally filter by name pattern.";
+      return "List all entries in a log file. Returns log metadata (time range, duration, "
+          + "truncation status) and entry list with types and sample counts. "
+          + "Optionally filter by name pattern.";
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("pattern", "string", "Optional pattern to filter entry names (substring match)", false)
           .build();
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log file loaded. Use load_log first.");
-
-      var pattern = arguments.has("pattern") ? arguments.get("pattern").getAsString() : null;
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
+      var pattern = arguments.has("pattern") && !arguments.get("pattern").isJsonNull()
+          ? arguments.get("pattern").getAsString() : null;
 
       var entriesArray = new JsonArray();
       var sortedEntries = log.entries().values().stream()
-          .filter(e -> pattern == null || e.name().contains(pattern))
+          .filter(e -> pattern == null || e.name().toLowerCase().contains(pattern.toLowerCase()))
           .sorted(Comparator.comparing(EntryInfo::name))
           .toList();
 
@@ -219,12 +166,25 @@ public final class CoreTools {
       result.addProperty("success", true);
       result.addProperty("log_path", log.path());
       result.addProperty("entry_count", entriesArray.size());
+
+      // Log metadata (replaces the discovery role of the removed load_log tool)
+      var timeRange = new JsonObject();
+      timeRange.addProperty("start", log.minTimestamp());
+      timeRange.addProperty("end", log.maxTimestamp());
+      timeRange.addProperty("duration", log.duration());
+      result.add("time_range_sec", timeRange);
+
+      if (log.truncated()) {
+        result.addProperty("truncated", true);
+        result.addProperty("warning", log.truncationMessage());
+      }
+
       result.add("entries", entriesArray);
       return result;
     }
   }
 
-  static class GetEntryInfoTool implements Tool {
+  static class GetEntryInfoTool extends LogRequiringTool {
     @Override
     public String name() {
       return "get_entry_info";
@@ -236,21 +196,15 @@ public final class CoreTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("name", "string", "The entry name (e.g., '/Vision/Summary/ObservationScore')", true)
           .build();
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log file loaded. Use load_log first.");
-
-      if (!arguments.has("name") || arguments.get("name").isJsonNull()) {
-        return errorResult("Missing required parameter: name");
-      }
-      var name = arguments.get("name").getAsString();
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
+      var name = getRequiredString(arguments, "name");
       var entry = log.entries().get(name);
 
       if (entry == null) {
@@ -299,7 +253,7 @@ public final class CoreTools {
     }
   }
 
-  static class ReadEntryTool implements Tool {
+  static class ReadEntryTool extends LogRequiringTool {
     @Override
     public String name() {
       return "read_entry";
@@ -311,7 +265,7 @@ public final class CoreTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("name", "string", "The entry name", true)
           .addNumberProperty("start_time", "Start timestamp in seconds (optional)", false, null)
@@ -322,33 +276,24 @@ public final class CoreTools {
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log file loaded. Use load_log first.");
-
-      if (!arguments.has("name") || arguments.get("name").isJsonNull()) {
-        return errorResult("Missing required parameter: name");
-      }
-      var name = arguments.get("name").getAsString();
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
+      var name = getRequiredString(arguments, "name");
       var allValues = log.values().get(name);
 
-      if (allValues == null) return errorResult("Entry not found: " + name);
+      if (allValues == null) {
+        throw new IllegalArgumentException("Entry not found: " + name);
+      }
 
-      var startTime = arguments.has("start_time") && !arguments.get("start_time").isJsonNull()
-          ? arguments.get("start_time").getAsDouble() : null;
-      var endTime = arguments.has("end_time") && !arguments.get("end_time").isJsonNull()
-          ? arguments.get("end_time").getAsDouble() : null;
-      int limit = arguments.has("limit") && !arguments.get("limit").isJsonNull()
-          ? arguments.get("limit").getAsInt() : 100;
-      int offset = arguments.has("offset") && !arguments.get("offset").isJsonNull()
-          ? arguments.get("offset").getAsInt() : 0;
+      var startTime = getOptDouble(arguments, "start_time");
+      var endTime = getOptDouble(arguments, "end_time");
+      int limit = getOptInt(arguments, "limit", 100);
+      int offset = getOptInt(arguments, "offset", 0);
 
-      // Validate numeric parameters
       if (limit <= 0) {
-        return errorResult("Parameter 'limit' must be positive, got " + limit);
+        throw new IllegalArgumentException("Parameter 'limit' must be positive, got " + limit);
       }
       if (offset < 0) {
-        return errorResult("Parameter 'offset' must be non-negative, got " + offset);
+        throw new IllegalArgumentException("Parameter 'offset' must be non-negative, got " + offset);
       }
 
       var filtered = allValues.stream()
@@ -390,7 +335,7 @@ public final class CoreTools {
 
     @Override
     public String description() {
-      return "List all currently loaded log files.";
+      return "List all currently cached log files and cache status.";
     }
 
     @Override
@@ -401,127 +346,20 @@ public final class CoreTools {
     @Override
     public JsonElement execute(JsonObject arguments) throws Exception {
       var logManager = getLogManager();
-      if (logManager == null) return errorResult("Log manager not available");
-      
+
       var paths = logManager.getLoadedLogPaths();
-      var activePath = logManager.getActiveLogPath();
 
       var logsArray = new JsonArray();
       for (var path : paths) {
         var logObj = new JsonObject();
         logObj.addProperty("path", path);
-        logObj.addProperty("is_active", path.equals(activePath));
         logsArray.add(logObj);
       }
 
       var result = new JsonObject();
       result.addProperty("success", true);
       result.addProperty("loaded_count", paths.size());
-      result.addProperty("max_cached_logs", logManager.getMaxLoadedLogs());
       result.add("logs", logsArray);
-      return result;
-    }
-  }
-
-  static class SetActiveLogTool implements Tool {
-    @Override
-    public String name() {
-      return "set_active_log";
-    }
-
-    @Override
-    public String description() {
-      return "Set which loaded log file should be used for subsequent queries.";
-    }
-
-    @Override
-    public JsonObject inputSchema() {
-      return new SchemaBuilder()
-          .addProperty("path", "string", "Path to the log file (must already be loaded)", true)
-          .build();
-    }
-
-    @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      if (!arguments.has("path") || arguments.get("path").isJsonNull()) {
-        return errorResult("Missing required parameter: path");
-      }
-      var path = arguments.get("path").getAsString();
-
-      if (getLogManager().setActiveLog(path)) {
-        var result = new JsonObject();
-        result.addProperty("success", true);
-        result.addProperty("active_log", getLogManager().getActiveLogPath());
-        return result;
-      } else {
-        return errorResult("Log not loaded: " + path);
-      }
-    }
-  }
-
-  static class UnloadLogTool implements Tool {
-    @Override
-    public String name() {
-      return "unload_log";
-    }
-
-    @Override
-    public String description() {
-      return "Unload a log file from memory to free resources.";
-    }
-
-    @Override
-    public JsonObject inputSchema() {
-      return new SchemaBuilder()
-          .addProperty("path", "string", "Path to the log file to unload", true)
-          .build();
-    }
-
-    @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      if (!arguments.has("path") || arguments.get("path").isJsonNull()) {
-        return errorResult("Missing required parameter: path");
-      }
-      var path = arguments.get("path").getAsString();
-
-      if (getLogManager().unloadLog(path)) {
-        var result = new JsonObject();
-        result.addProperty("success", true);
-        result.addProperty("message", "Log unloaded: " + path);
-        result.addProperty("remaining_logs", getLogManager().getLoadedLogPaths().size());
-        return result;
-      } else {
-        return errorResult("Log not loaded: " + path);
-      }
-    }
-  }
-
-  static class UnloadAllLogsTool implements Tool {
-    @Override
-    public String name() {
-      return "unload_all_logs";
-    }
-
-    @Override
-    public String description() {
-      return "Unload all log files from memory to free resources.";
-    }
-
-    @Override
-    public JsonObject inputSchema() {
-      return new SchemaBuilder().build();
-    }
-
-    @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var logManager = getLogManager();
-      int count = logManager.getLoadedLogPaths().size();
-      logManager.unloadAllLogs();
-
-      var result = new JsonObject();
-      result.addProperty("success", true);
-      result.addProperty("unloaded_count", count);
-      result.addProperty("message", "Unloaded " + count + " log(s)");
       return result;
     }
   }
@@ -600,15 +438,17 @@ public final class CoreTools {
       var result = new JsonObject();
       result.addProperty("success", true);
       result.addProperty("status", "OK");
+      result.addProperty("server_version", org.triplehelix.wpilogmcp.Version.VERSION);
 
       var logManager = getLogManager();
       result.addProperty("loaded_logs", logManager.getLoadedLogPaths().size());
-      result.addProperty("active_log", logManager.getActiveLog() != null ?
-          logManager.getActiveLog().path() : null);
 
       // TBA availability
       var tbaConfig = org.triplehelix.wpilogmcp.tba.TbaConfig.getInstance();
       result.addProperty("tba_available", tbaConfig.isConfigured());
+
+      // RevLog sync status
+      result.addProperty("revlog_sync_in_progress", logManager.isAnyRevLogSyncInProgress());
 
       // JVM memory info
       var runtime = Runtime.getRuntime();
@@ -619,9 +459,103 @@ public final class CoreTools {
       memory.addProperty("free_mb", runtime.freeMemory() / (1024L * 1024L));
       result.add("jvm_memory", memory);
 
-      // Cache memory estimate
+      // In-memory cache info
       result.addProperty("cache_memory_mb", logManager.getEstimatedMemoryUsageMb());
 
+      // Disk cache info
+      var diskCache = logManager.getDiskCache();
+      var diskCacheInfo = new JsonObject();
+      diskCacheInfo.addProperty("enabled", diskCache.isEnabled());
+      try {
+        var cacheDir = logManager.getCacheDirectory().getPath();
+        diskCacheInfo.addProperty("directory", cacheDir.toString());
+        if (java.nio.file.Files.isDirectory(cacheDir)) {
+          long fileCount = 0;
+          long totalBytes = 0;
+          try (var stream = java.nio.file.Files.list(cacheDir)) {
+            var files = stream.filter(f -> f.toString().endsWith(".msgpack")).toList();
+            fileCount = files.size();
+            for (var f : files) {
+              totalBytes += java.nio.file.Files.size(f);
+            }
+          }
+          diskCacheInfo.addProperty("cached_files", fileCount);
+          diskCacheInfo.addProperty("total_size_mb", totalBytes / (1024L * 1024L));
+        }
+      } catch (Exception e) {
+        diskCacheInfo.addProperty("error", e.getMessage());
+      }
+      diskCacheInfo.addProperty("format_version",
+          org.triplehelix.wpilogmcp.cache.DiskCacheSerializer.CURRENT_FORMAT_VERSION);
+      result.add("disk_cache", diskCacheInfo);
+
+      return result;
+    }
+  }
+
+  /**
+   * Provides year-specific FRC game information for contextual log analysis.
+   */
+  static class GetGameInfoTool implements Tool {
+    @Override
+    public String name() {
+      return "get_game_info";
+    }
+
+    @Override
+    public String description() {
+      return "Get year-specific FRC game information (match timing, scoring values, field geometry, "
+          + "game pieces, and analysis hints). Use this to understand the context of a log file: "
+          + "what the match phases are, what scoring actions look like, and what mechanisms to expect. "
+          + "Defaults to the current season if no year is specified.";
+    }
+
+    @Override
+    public JsonObject inputSchema() {
+      return new SchemaBuilder()
+          .addIntegerProperty("season", "FRC season year (e.g., 2026). Defaults to current year.", false, null)
+          .build();
+    }
+
+    @Override
+    public JsonElement execute(JsonObject arguments) throws Exception {
+      var kb = org.triplehelix.wpilogmcp.game.GameKnowledgeBase.getInstance();
+
+      int season = arguments.has("season") && !arguments.get("season").isJsonNull()
+          ? arguments.get("season").getAsInt()
+          : java.time.Year.now().getValue();
+
+      var game = kb.getGame(season);
+      if (game == null) {
+        var result = new JsonObject();
+        result.addProperty("success", false);
+        result.addProperty("error", "No game data available for season " + season);
+        var available = kb.availableSeasons();
+        if (available.length > 0) {
+          var arr = new com.google.gson.JsonArray();
+          for (int s : available) arr.add(s);
+          result.add("available_seasons", arr);
+        }
+        return result;
+      }
+
+      var result = new JsonObject();
+      result.addProperty("success", true);
+      result.addProperty("season", game.season());
+      result.addProperty("game_name", game.gameName());
+      result.add("match_timing", game.raw().getAsJsonObject("match_timing"));
+      result.add("scoring", game.scoring());
+      result.add("field_geometry", game.raw().getAsJsonObject("field_geometry"));
+      result.add("game_pieces", game.gamePieces());
+      if (game.analysisHints() != null) {
+        result.add("analysis_hints", game.analysisHints());
+      }
+      if (game.raw().has("typical_mechanisms")) {
+        result.add("typical_mechanisms", game.raw().getAsJsonArray("typical_mechanisms"));
+      }
+      if (game.raw().has("hub_mechanics")) {
+        result.add("hub_mechanics", game.raw().getAsJsonObject("hub_mechanics"));
+      }
       return result;
     }
   }

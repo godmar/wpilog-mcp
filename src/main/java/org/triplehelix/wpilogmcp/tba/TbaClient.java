@@ -32,6 +32,9 @@ public class TbaClient {
   /** HTTP request timeout. */
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
+  /** Maximum entries per cache map to prevent unbounded memory growth. */
+  private static final int MAX_CACHE_SIZE = 200;
+
   /** Singleton instance. */
   private static TbaClient instance;
 
@@ -121,6 +124,7 @@ public class TbaClient {
       var endpoint = "/event/" + eventKey;
       var data = fetchJson(endpoint, JsonObject.class);
       eventCache.put(eventKey, new CachedData<>(data));
+      evictStaleEntries(eventCache);
       return Optional.ofNullable(data);
     } catch (Exception e) {
       logger.warn("TBA API error for event {}: {}", eventKey, e.getMessage());
@@ -154,12 +158,65 @@ public class TbaClient {
       var endpoint = "/match/" + matchKey;
       var data = fetchJson(endpoint, JsonObject.class);
       matchCache.put(matchKey, new CachedData<>(data));
+      evictStaleEntries(matchCache);
       return Optional.ofNullable(data);
     } catch (Exception e) {
       logger.warn("TBA API error for match {}: {}", matchKey, e.getMessage());
       matchCache.put(matchKey, new CachedData<>(null));
       return Optional.empty();
     }
+  }
+
+  /**
+   * Gets all events for a year from TBA. Results are cached.
+   *
+   * @param year The competition year
+   * @return Array of event objects, or empty if unavailable
+   */
+  public Optional<JsonArray> getEventsForYear(int year) {
+    if (!isAvailable()) return Optional.empty();
+
+    try {
+      return Optional.ofNullable(fetchJson("/events/" + year, JsonArray.class));
+    } catch (Exception e) {
+      logger.debug("Failed to fetch events for year {}: {}", year, e.getMessage());
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Searches for events matching a partial name or code for a given year.
+   *
+   * @param year The competition year
+   * @param query The search string (matched against event code, name, and city)
+   * @param maxResults Maximum number of results to return
+   * @return List of matching event codes with names
+   */
+  public List<String> searchEvents(int year, String query, int maxResults) {
+    var eventsOpt = getEventsForYear(year);
+    if (eventsOpt.isEmpty()) return List.of();
+
+    var lowerQuery = query.toLowerCase();
+    var results = new java.util.ArrayList<String>();
+
+    for (var element : eventsOpt.get()) {
+      if (!element.isJsonObject()) continue;
+      var event = element.getAsJsonObject();
+
+      String eventCode = event.has("event_code") ? event.get("event_code").getAsString() : "";
+      String name = event.has("name") ? event.get("name").getAsString() : "";
+      String city = event.has("city") && !event.get("city").isJsonNull()
+          ? event.get("city").getAsString() : "";
+      String key = event.has("key") ? event.get("key").getAsString() : "";
+
+      if (eventCode.toLowerCase().contains(lowerQuery)
+          || name.toLowerCase().contains(lowerQuery)
+          || city.toLowerCase().contains(lowerQuery)) {
+        results.add(eventCode + " (" + name + ")");
+        if (results.size() >= maxResults) break;
+      }
+    }
+    return results;
   }
 
   /**
@@ -184,6 +241,7 @@ public class TbaClient {
       var endpoint = "/event/" + eventKey + "/matches";
       var data = fetchJson(endpoint, JsonArray.class);
       eventMatchesCache.put(eventKey, new CachedData<>(data));
+      evictStaleEntries(eventMatchesCache);
       return Optional.ofNullable(data);
     } catch (Exception e) {
       logger.warn("TBA API error for event matches {}: {}", eventKey, e.getMessage());
@@ -459,9 +517,8 @@ public class TbaClient {
     if ("qm".equals(compLevel)) {
       matchKey = eventKey + "_qm" + matchNumber;
     } else if ("sf".equals(compLevel)) {
-      int setNum = ((matchNumber - 1) / 2) + 1;
-      int matchInSet = ((matchNumber - 1) % 2) + 1;
-      matchKey = eventKey + "_sf" + setNum + "m" + matchInSet;
+      // Since 2023, FRC uses double-elimination where semifinal keys are sequential
+      matchKey = eventKey + "_sf" + matchNumber + "m1";
     } else if ("f".equals(compLevel)) {
       matchKey = eventKey + "_f1m" + matchNumber;
     } else {
@@ -526,6 +583,21 @@ public class TbaClient {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IOException("Request interrupted", e);
+    }
+  }
+
+  /**
+   * Evicts expired entries and trims to MAX_CACHE_SIZE if a cache exceeds its limit.
+   * Called periodically to prevent unbounded memory growth in long-running servers.
+   */
+  private <T> void evictStaleEntries(Map<String, CachedData<T>> cacheMap) {
+    // Remove expired entries first
+    cacheMap.entrySet().removeIf(e -> e.getValue().isExpired());
+    // If still over limit, remove oldest entries
+    while (cacheMap.size() > MAX_CACHE_SIZE) {
+      var oldest = cacheMap.entrySet().stream()
+          .min((a, b) -> a.getValue().cachedAt.compareTo(b.getValue().cachedAt));
+      oldest.ifPresent(e -> cacheMap.remove(e.getKey()));
     }
   }
 

@@ -4,7 +4,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import org.triplehelix.wpilogmcp.log.LogDirectory;
 import org.triplehelix.wpilogmcp.log.LogManager;
-import org.triplehelix.wpilogmcp.log.ParsedLog;
+import org.triplehelix.wpilogmcp.log.LogData;
 import org.triplehelix.wpilogmcp.log.TimestampedValue;
 import org.triplehelix.wpilogmcp.mcp.McpServer;
 import org.triplehelix.wpilogmcp.tba.TbaClient;
@@ -37,7 +37,8 @@ import static org.triplehelix.wpilogmcp.tools.ToolUtils.*;
  *
  *     {@literal @}Override
  *     protected JsonElement executeInternal(JsonObject arguments) throws Exception {
- *         var log = requireActiveLog();
+ *         var path = getRequiredString(arguments, "path");
+ *         var log = logManager.getOrLoad(path);
  *         var name = getRequiredString(arguments, "name");
  *         var values = requireEntry(log, name);
  *
@@ -83,10 +84,10 @@ public abstract class ToolBase implements McpServer.Tool {
    * @since 0.4.0
    */
   protected ToolBase(ToolDependencies deps) {
-    this.logManager = deps.getLogManager();
-    this.tbaClient = deps.getTbaClient();
-    this.tbaConfig = deps.getTbaConfig();
-    this.logDirectory = deps.getLogDirectory();
+    this.logManager = deps.logManager();
+    this.tbaClient = deps.tbaClient();
+    this.tbaConfig = deps.tbaConfig();
+    this.logDirectory = deps.logDirectory();
   }
 
   /**
@@ -148,6 +149,11 @@ public abstract class ToolBase implements McpServer.Tool {
     } catch (IllegalArgumentException e) {
       // Parameter validation errors - return user-friendly error
       return errorResult(e.getMessage());
+    } catch (Exception e) {
+      // Unexpected errors - return error response instead of propagating
+      // raw exceptions to the MCP layer
+      var msg = e.getMessage();
+      return errorResult("Internal error: " + (msg != null ? msg : e.getClass().getSimpleName()));
     }
   }
 
@@ -166,24 +172,6 @@ public abstract class ToolBase implements McpServer.Tool {
   // ===== LOG ACQUISITION HELPERS =====
 
   /**
-   * Gets the active log or throws with a clear error message.
-   *
-   * <p>Throws {@link IllegalArgumentException} if no log is loaded,
-   * which will be automatically converted to an error response.
-   *
-   * @return The active ParsedLog
-   * @throws IllegalArgumentException if no log is loaded
-   */
-  protected ParsedLog requireActiveLog() throws IllegalArgumentException {
-    var log = logManager.getActiveLog();
-    if (log == null) {
-      throw new IllegalArgumentException(
-          "No log file is currently loaded. Use load_log first.");
-    }
-    return log;
-  }
-
-  /**
    * Gets entry values or throws with helpful error message including suggestions.
    *
    * <p>If the entry is not found, searches for similar entry names (case-insensitive
@@ -194,7 +182,7 @@ public abstract class ToolBase implements McpServer.Tool {
    * @return The list of timestamped values for the entry
    * @throws IllegalArgumentException if entry not found
    */
-  protected List<TimestampedValue> requireEntry(ParsedLog log, String name)
+  protected List<TimestampedValue> requireEntry(LogData log, String name)
       throws IllegalArgumentException {
     var values = log.values().get(name);
     if (values == null) {
@@ -260,12 +248,13 @@ public abstract class ToolBase implements McpServer.Tool {
   /**
    * Extracts numeric values from timestamped data with optional time filtering.
    *
-   * <p>Filters by time range and includes only values that are instances of {@link Number}.
+   * <p>Filters by time range and includes only finite numeric values (NaN and Infinity
+   * are excluded to prevent silent corruption of statistical calculations).
    *
    * @param values The timestamped values
    * @param startTime Optional start time (inclusive), or null
    * @param endTime Optional end time (inclusive), or null
-   * @return Array of numeric values
+   * @return Array of finite numeric values
    */
   protected double[] extractNumericData(
       List<TimestampedValue> values,
@@ -275,6 +264,7 @@ public abstract class ToolBase implements McpServer.Tool {
         .filter(tv -> inTimeRange(tv.timestamp(), startTime, endTime))
         .filter(tv -> tv.value() instanceof Number)
         .mapToDouble(tv -> ((Number) tv.value()).doubleValue())
+        .filter(Double::isFinite)
         .toArray();
   }
 
@@ -300,7 +290,7 @@ public abstract class ToolBase implements McpServer.Tool {
    * @param pattern The pattern to search for (case-insensitive)
    * @return The first matching entry name, or null if no match found
    */
-  protected String findEntryByPattern(ParsedLog log, String pattern) {
+  protected String findEntryByPattern(LogData log, String pattern) {
     var lowerPattern = pattern.toLowerCase();
     return log.entries().keySet().stream()
         .filter(name -> name.toLowerCase().contains(lowerPattern))
@@ -315,7 +305,7 @@ public abstract class ToolBase implements McpServer.Tool {
    * @param pattern The pattern to search for (case-insensitive)
    * @return List of matching entry names (may be empty)
    */
-  protected List<String> findEntriesByPattern(ParsedLog log, String pattern) {
+  protected List<String> findEntriesByPattern(LogData log, String pattern) {
     var lowerPattern = pattern.toLowerCase();
     return log.entries().keySet().stream()
         .filter(name -> name.toLowerCase().contains(lowerPattern))

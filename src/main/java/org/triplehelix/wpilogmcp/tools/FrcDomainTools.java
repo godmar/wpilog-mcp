@@ -5,10 +5,12 @@ import com.google.gson.JsonObject;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
-import org.triplehelix.wpilogmcp.log.ParsedLog;
+import org.triplehelix.wpilogmcp.game.GameKnowledgeBase;
+import org.triplehelix.wpilogmcp.log.LogData;
 import org.triplehelix.wpilogmcp.log.TimestampedValue;
-import org.triplehelix.wpilogmcp.mcp.McpServer;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
 import org.triplehelix.wpilogmcp.mcp.McpServer.SchemaBuilder;
 
 import static org.triplehelix.wpilogmcp.tools.ToolUtils.*;
@@ -39,19 +41,24 @@ public final class FrcDomainTools {
    *
    * @param server The MCP server to register tools with
    */
-  public static void registerAll(McpServer server) {
-    server.registerTool(new GetDsTimelineTool());
-    server.registerTool(new AnalyzeVisionTool());
-    server.registerTool(new ProfileMechanismTool());
-    server.registerTool(new AnalyzeAutoTool());
-    server.registerTool(new AnalyzeCyclesTool());
-    server.registerTool(new AnalyzeReplayDriftTool());
-    server.registerTool(new AnalyzeLoopTimingTool());
-    server.registerTool(new AnalyzeCanBusTool());
-    server.registerTool(new PredictBatteryHealthTool());
+  public static void registerAll(ToolRegistry registry) {
+    registry.registerTool(new GetDsTimelineTool());
+    registry.registerTool(new AnalyzeVisionTool());
+    registry.registerTool(new ProfileMechanismTool());
+    registry.registerTool(new AnalyzeAutoTool());
+    registry.registerTool(new AnalyzeCyclesTool());
+    registry.registerTool(new AnalyzeReplayDriftTool());
+    registry.registerTool(new AnalyzeLoopTimingTool());
+    registry.registerTool(new AnalyzeCanBusTool());
+    registry.registerTool(new PredictBatteryHealthTool());
   }
 
   // ==================== SHARED HELPER METHODS ====================
+
+  /** Delegate to shared percentile implementation in ToolUtils. */
+  private static double interpolatedPercentile(double[] sortedData, double p) {
+    return ToolUtils.percentile(sortedData, p);
+  }
 
   /**
    * Calculate the Euclidean distance between two poses (works for Pose2d and Pose3d).
@@ -101,24 +108,25 @@ public final class FrcDomainTools {
     @Override
     public String description() {
       return "Generate a chronological timeline of critical robot events: enable/disable, "
-          + "match phases, brownouts, joystick disconnects, errors, and warnings.";
+          + "match phases, brownouts, joystick disconnects, errors, and warnings."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addNumberProperty("start_time", "Start timestamp in seconds", false, null)
           .addNumberProperty("end_time", "End timestamp in seconds", false, null)
-          .addNumberProperty("brownout_threshold", "Voltage threshold for brownout detection (default: 7.0V)", false, 7.0)
+          .addNumberProperty("brownout_threshold", "Voltage threshold for brownout detection (default: 6.8V for roboRIO 1, use 6.3V for roboRIO 2)", false, 6.8)
           .build();
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
       var startTime = getOptDouble(arguments, "start_time");
       var endTime = getOptDouble(arguments, "end_time");
-      double brownoutThreshold = getOptDouble(arguments, "brownout_threshold", 7.0);
+      double brownoutThreshold = getOptDouble(arguments, "brownout_threshold", 6.8);
 
       var events = new ArrayList<JsonObject>();
 
@@ -126,6 +134,16 @@ public final class FrcDomainTools {
       var lowerEntryNames = new HashMap<String, String>();
       for (var entryName : log.entries().keySet()) {
         lowerEntryNames.put(entryName, entryName.toLowerCase());
+      }
+
+      // First pass: find the Enabled values for cross-referencing with auto mode
+      List<TimestampedValue> enabledValuesForTimeline = null;
+      for (var entryName : log.entries().keySet()) {
+        var lower = lowerEntryNames.get(entryName);
+        if (lower.contains("driverstation") && lower.contains("enabled")) {
+          enabledValuesForTimeline = log.values().get(entryName);
+          break;
+        }
       }
 
       for (var entryName : log.entries().keySet()) {
@@ -156,17 +174,63 @@ public final class FrcDomainTools {
           var values = log.values().get(entryName);
           if (values != null) {
             var lastState = (Boolean) null;
+            boolean pendingAutoStart = false;
+            double autoFlagTime = 0;
+            String autoSource = entryName;
             for (var tv : values) {
               if (!inTimeRange(tv.timestamp(), startTime, endTime)) continue;
               if (tv.value() instanceof Boolean isAuto) {
                 if (lastState == null || !lastState.equals(isAuto)) {
+                  if (isAuto && !ToolUtils.isEnabledAt(enabledValuesForTimeline, tv.timestamp())) {
+                    // Auto flag set but robot not yet enabled — defer the AUTO_START
+                    pendingAutoStart = true;
+                    autoFlagTime = tv.timestamp();
+                    lastState = isAuto;
+                    continue;
+                  }
+                  // If transitioning out of auto and we have a pending deferred AUTO_START,
+                  // resolve it now: find when the robot was first enabled during auto
+                  if (!isAuto && pendingAutoStart && enabledValuesForTimeline != null) {
+                    for (var ev : enabledValuesForTimeline) {
+                      if (ev.timestamp() > autoFlagTime && ev.timestamp() < tv.timestamp()
+                          && ev.value() instanceof Boolean en && en) {
+                        var autoEvent = new JsonObject();
+                        autoEvent.addProperty("timestamp", ev.timestamp());
+                        autoEvent.addProperty("type", "AUTO_START");
+                        autoEvent.addProperty("category", "match_phase");
+                        autoEvent.addProperty("source", autoSource);
+                        events.add(autoEvent);
+                        break;
+                      }
+                    }
+                    pendingAutoStart = false;
+                  }
                   var event = new JsonObject();
                   event.addProperty("timestamp", tv.timestamp());
                   event.addProperty("type", isAuto ? "AUTO_START" : "TELEOP_START");
                   event.addProperty("category", "match_phase");
-                  event.addProperty("source", entryName);
+                  event.addProperty("source", autoSource);
                   events.add(event);
                   lastState = isAuto;
+                }
+              }
+            }
+            // If auto flag was set and robot never transitioned out of auto,
+            // check if robot got enabled while still in auto
+            if (pendingAutoStart && enabledValuesForTimeline != null) {
+              for (var ev : enabledValuesForTimeline) {
+                if (ev.timestamp() > autoFlagTime && inTimeRange(ev.timestamp(), startTime, endTime)
+                    && ev.value() instanceof Boolean en && en) {
+                  var autoState = ToolUtils.getValueAtTimeZoh(values, ev.timestamp());
+                  if (Boolean.TRUE.equals(autoState)) {
+                    var event = new JsonObject();
+                    event.addProperty("timestamp", ev.timestamp());
+                    event.addProperty("type", "AUTO_START");
+                    event.addProperty("category", "match_phase");
+                    event.addProperty("source", autoSource);
+                    events.add(event);
+                  }
+                  break;
                 }
               }
             }
@@ -186,6 +250,9 @@ public final class FrcDomainTools {
               if (!inTimeRange(tv.timestamp(), startTime, endTime)) continue;
               if (tv.value() instanceof Number num) {
                 double voltage = num.doubleValue();
+                // Hysteresis: enter brownout below threshold, exit only above threshold + 0.2V.
+                // Prevents noisy voltage (e.g., loose connectors) from inflating event counts.
+                double hysteresis = 0.2;
                 if (voltage < brownoutThreshold && !inBrownout) {
                   var event = new JsonObject();
                   event.addProperty("timestamp", tv.timestamp());
@@ -195,7 +262,7 @@ public final class FrcDomainTools {
                   event.addProperty("source", entryName);
                   events.add(event);
                   inBrownout = true;
-                } else if (voltage >= brownoutThreshold && inBrownout) {
+                } else if (voltage >= brownoutThreshold + hysteresis && inBrownout) {
                   var event = new JsonObject();
                   event.addProperty("timestamp", tv.timestamp());
                   event.addProperty("type", "BROWNOUT_END");
@@ -220,11 +287,19 @@ public final class FrcDomainTools {
         categoryCounts.merge(cat, 1, Integer::sum);
       }
 
-      return success()
+      var builder = success()
           .addProperty("event_count", events.size())
           .addData("summary", GSON.toJsonTree(categoryCounts))
-          .addData("events", GSON.toJsonTree(events))
-          .build();
+          .addData("events", GSON.toJsonTree(events));
+
+      // Add data quality from enabled values if available
+      if (enabledValuesForTimeline != null && !enabledValuesForTimeline.isEmpty()) {
+        var quality = DataQuality.fromValues(enabledValuesForTimeline);
+        builder.addDataQuality(quality)
+            .addDirectives(AnalysisDirectives.fromQuality(quality).addSingleMatchCaveat());
+      }
+
+      return builder.build();
     }
   }
 
@@ -235,11 +310,12 @@ public final class FrcDomainTools {
     @Override
     public String description() {
       return "Analyze vision system reliability: target acquisition rate, flicker detection, "
-          + "pose discrepancy between vision and odometry, and sudden pose jumps.";
+          + "pose discrepancy between vision and odometry, and sudden pose jumps."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("vision_prefix", "string", "Entry path prefix for vision data", false)
           .addNumberProperty("start_time", "Start timestamp in seconds", false, null)
@@ -250,7 +326,7 @@ public final class FrcDomainTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
       var visionPrefix = getOptString(arguments, "vision_prefix", null);
       var startTime = getOptDouble(arguments, "start_time");
@@ -361,6 +437,16 @@ public final class FrcDomainTools {
         builder.addProperty("jump_count", poseJumps.size());
       }
 
+      // Data quality from first target entry
+      if (!targetValidEntries.isEmpty()) {
+        var tvVals = log.values().get(targetValidEntries.get(0));
+        if (tvVals != null) {
+          var quality = DataQuality.fromValues(tvVals);
+          builder.addDataQuality(quality)
+              .addDirectives(AnalysisDirectives.fromQuality(quality).addSingleMatchCaveat());
+        }
+      }
+
       return builder.build();
     }
   }
@@ -372,11 +458,12 @@ public final class FrcDomainTools {
     @Override
     public String description() {
       return "Analyze closed-loop mechanism performance: following error (RMSE), settling time, "
-          + "stall detection, and motor temperature profiling.";
+          + "stall detection, and motor temperature profiling."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MECHANISM;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("mechanism_name", "string", "Mechanism name or prefix", true)
           .addNumberProperty("start_time", "Start timestamp", false, null)
@@ -386,7 +473,7 @@ public final class FrcDomainTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
       var mechanismName = getRequiredString(arguments, "mechanism_name");
       var startTime = getOptDouble(arguments, "start_time");
@@ -456,6 +543,20 @@ public final class FrcDomainTools {
         if (!stallEvents.isEmpty()) {
           builder.addData("stall_events", GSON.toJsonTree(stallEvents));
           builder.addProperty("stall_count", stallEvents.size());
+        }
+      }
+
+      // Data quality from measurement entry if available
+      var qualityEntry = measurementEntry != null ? measurementEntry
+          : (velocityEntry != null ? velocityEntry : null);
+      if (qualityEntry != null) {
+        var qVals = log.values().get(qualityEntry);
+        if (qVals != null) {
+          var quality = DataQuality.fromValues(qVals);
+          builder.addDataQuality(quality)
+              .addDirectives(AnalysisDirectives.fromQuality(quality)
+                  .addSingleMatchCaveat()
+                  .addFollowup("Use moi_regression for mechanism inertia estimation"));
         }
       }
 
@@ -539,7 +640,7 @@ public final class FrcDomainTools {
 
         // Detect setpoint change
         if (lastSetpoint == null || Math.abs(spVal - lastSetpoint) > Math.abs(lastSetpoint * 0.05)) {
-          if (maxOvershoot != null && lastSetpoint != null && lastSetpoint != 0) {
+          if (maxOvershoot != null && lastSetpoint != null && Math.abs(lastSetpoint) > 0.001) {
             overshoots.add(maxOvershoot * 100.0 / Math.abs(lastSetpoint));
           }
           lastSetpoint = spVal;
@@ -617,18 +718,19 @@ public final class FrcDomainTools {
     public String description() {
       return "Analyze autonomous routine: identify selected routine, path following error, "
           + "completion time, and phase breakdown. "
-          + "Returns 'no auto period detected' if log does not contain autonomous phase data.";
+          + "Returns 'no auto period detected' if log does not contain autonomous phase data."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("auto_prefix", "string", "Entry path prefix for auto data", false)
           .build();
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {var autoPrefix = getOptString(arguments, "auto_prefix", null);
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {var autoPrefix = getOptString(arguments, "auto_prefix", null);
 
       var result = new JsonObject();
       result.addProperty("success", true);
@@ -645,6 +747,8 @@ public final class FrcDomainTools {
           });
 
       // Find auto period (first 15 seconds or until teleop)
+      // IMPORTANT: Auto doesn't truly start until the robot is both in autonomous
+      // mode AND enabled. The FMS sets the Autonomous flag before the countdown ends.
       Double autoStartTime = null;
       Double autoEndTime = null;
 
@@ -654,17 +758,55 @@ public final class FrcDomainTools {
         lowerEntryNames.put(entryName, entryName.toLowerCase());
       }
 
+      // Find enabled values for cross-referencing
+      List<TimestampedValue> enabledValuesForAuto = null;
+      for (var entryName : log.entries().keySet()) {
+        var lower = lowerEntryNames.get(entryName);
+        if (lower.contains("driverstation") && lower.contains("enabled")) {
+          enabledValuesForAuto = log.values().get(entryName);
+          break;
+        }
+      }
+
       for (var entryName : log.entries().keySet()) {
         var lower = lowerEntryNames.get(entryName);
         if (lower.contains("driverstation") && (lower.contains("autonomous") || lower.contains("auto"))) {
           var values = log.values().get(entryName);
           if (values != null) {
+            boolean autoFlagSet = false;
             for (TimestampedValue tv : values) {
               if (tv.value() instanceof Boolean isAuto) {
                 if (isAuto && autoStartTime == null) {
-                  autoStartTime = tv.timestamp();
+                  if (ToolUtils.isEnabledAt(enabledValuesForAuto, tv.timestamp())) {
+                    autoStartTime = tv.timestamp();
+                  } else {
+                    autoFlagSet = true; // Auto mode set but not yet enabled
+                  }
                 } else if (!isAuto && autoStartTime != null && autoEndTime == null) {
                   autoEndTime = tv.timestamp();
+                  break;
+                } else if (!isAuto && autoFlagSet) {
+                  // Auto mode ended without ever being enabled — no auto period
+                  autoFlagSet = false;
+                }
+              }
+            }
+            // If auto flag was set but we haven't found the enable yet, scan enabled values
+            if (autoFlagSet && autoStartTime == null && enabledValuesForAuto != null) {
+              // Find the first enable that happens while in auto mode
+              double autoFlagTime = -1;
+              double autoFlagEndTime = Double.MAX_VALUE;
+              for (var tv2 : values) {
+                if (tv2.value() instanceof Boolean isAuto) {
+                  if (isAuto && autoFlagTime < 0) autoFlagTime = tv2.timestamp();
+                  else if (!isAuto && autoFlagTime >= 0) { autoFlagEndTime = tv2.timestamp(); break; }
+                }
+              }
+              for (var ev : enabledValuesForAuto) {
+                if (ev.timestamp() >= autoFlagTime && ev.timestamp() < autoFlagEndTime
+                    && ev.value() instanceof Boolean en && en) {
+                  autoStartTime = ev.timestamp();
+                  autoEndTime = autoFlagEndTime < Double.MAX_VALUE ? autoFlagEndTime : null;
                   break;
                 }
               }
@@ -676,8 +818,18 @@ public final class FrcDomainTools {
 
       if (autoStartTime != null) {
         if (autoEndTime == null) {
-          // If we didn't find auto end, use 15 seconds
-          autoEndTime = autoStartTime + 15.0;
+          // If we didn't find auto end, use game knowledge base or 15s default
+          double autoDuration = 15.0;
+          try {
+            int seasonYear = ToolUtils.estimateSeasonYear(log);
+            var gameData = GameKnowledgeBase.getInstance().getGame(seasonYear);
+            if (gameData != null) {
+              autoDuration = gameData.autoDurationSec();
+            }
+          } catch (Exception e) {
+            // use default
+          }
+          autoEndTime = autoStartTime + autoDuration;
         }
         var autoDuration = autoEndTime - autoStartTime;
         result.addProperty("auto_start_time", autoStartTime);
@@ -691,11 +843,19 @@ public final class FrcDomainTools {
         }
       }
 
+      // Add data quality from enabled values if available
+      if (enabledValuesForAuto != null && !enabledValuesForAuto.isEmpty()) {
+        var quality = DataQuality.fromValues(enabledValuesForAuto);
+        var directives = AnalysisDirectives.fromQuality(quality).addSingleMatchCaveat();
+        result.add("data_quality", quality.toJson());
+        result.add("server_analysis_directives", directives.toJson());
+      }
+
       return result;
     }
 
     private JsonObject calculatePathFollowingError(
-        ParsedLog log,
+        LogData log,
         String prefix,
         double startTime,
         double endTime
@@ -770,21 +930,17 @@ public final class FrcDomainTools {
       return errorAnalysis;
     }
 
+    @SuppressWarnings("unchecked")
     private java.util.Map<String, Object> getActualPoseAtTime(
         java.util.List<TimestampedValue> values,
         double timestamp
     ) {
-      // Find closest pose (ZOH)
-      java.util.Map<String, Object> result = null;
-      for (TimestampedValue tv : values) {
-        if (tv.timestamp() > timestamp) break;
-        if (tv.value() instanceof java.util.Map) {
-          @SuppressWarnings("unchecked")
-          var pose = (java.util.Map<String, Object>) tv.value();
-          result = pose;
-        }
+      // Find closest pose (ZOH) using O(log n) binary search
+      var raw = ToolUtils.getValueAtTimeZoh(values, timestamp);
+      if (raw instanceof java.util.Map) {
+        return (java.util.Map<String, Object>) raw;
       }
-      return result;
+      return null;
     }
   }
 
@@ -796,11 +952,12 @@ public final class FrcDomainTools {
     public String description() {
       return "Analyze game piece handling cycle times with configurable cycle detection modes "
           + "(start-to-start or start-to-end), dead time tracking, and data quality warnings. "
-          + "Supports time filtering, case-sensitive/insensitive matching, and incomplete cycle detection.";
+          + "Supports time filtering, case-sensitive/insensitive matching, and incomplete cycle detection."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("state_entry", "string", "Entry name for mechanism state", true)
           .addProperty("cycle_mode", "string", "Cycle detection mode: 'start_to_start' or 'start_to_end' (default: 'start_to_start')", false)
@@ -815,7 +972,7 @@ public final class FrcDomainTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {// Parse parameters
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {// Parse parameters
       var stateEntry = getRequiredString(arguments, "state_entry");
       var cycleMode = getOptString(arguments, "cycle_mode", "start_to_start");
       var cycleStartState = getOptString(arguments, "cycle_start_state", null);
@@ -991,6 +1148,15 @@ public final class FrcDomainTools {
 
       // Add data quality warnings
       var warnings = detectDataQualityIssues(vals, cycleStartState, cycleEndState, idleState, caseSensitive, startTime, endTime);
+
+      // Warn about incomplete cycles
+      long incompleteCount = cycleDetails.stream()
+          .filter(c -> c.has("incomplete") && c.get("incomplete").getAsBoolean()).count();
+      if (incompleteCount > 0) {
+        warnings.add(incompleteCount + " cycle(s) incomplete (log ended mid-cycle). "
+            + "Exclude from statistical analysis.");
+      }
+
       if (!warnings.isEmpty()) {
         result.add("warnings", GSON.toJsonTree(warnings));
       }
@@ -1034,6 +1200,12 @@ public final class FrcDomainTools {
           result.addProperty("total_dead_time_periods", deadTimePeriods.size());
         }
       }
+
+      // Add data quality and analysis directives
+      var quality = DataQuality.fromValues(vals);
+      var directives = AnalysisDirectives.fromQuality(quality).addSingleMatchCaveat();
+      result.add("data_quality", quality.toJson());
+      result.add("server_analysis_directives", directives.toJson());
 
       return result;
     }private boolean statesEqual(String state1, String state2, boolean caseSensitive) {
@@ -1112,16 +1284,17 @@ public final class FrcDomainTools {
 
     @Override
     public String description() {
-      return "Validate AdvantageKit deterministic replay by comparing RealOutputs vs ReplayOutputs.";
+      return "Validate AdvantageKit deterministic replay by comparing RealOutputs vs ReplayOutputs."
+          + GUIDANCE_UNIVERSAL;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder().build();
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {var realEntries = log.entries().keySet().stream()
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {var realEntries = log.entries().keySet().stream()
           .filter(n -> n.contains("/RealOutputs/"))
           .toList();
 
@@ -1129,17 +1302,32 @@ public final class FrcDomainTools {
           .map(real -> {
             var replay = real.replace("/RealOutputs/", "/ReplayOutputs/");
             if (!log.entries().containsKey(replay)) return null;
-            
+
             var realVals = log.values().get(real);
             var replayVals = log.values().get(replay);
             if (realVals == null || replayVals == null) return null;
 
-            for (int i = 0; i < Math.min(realVals.size(), replayVals.size()); i++) {
-              if (!Objects.equals(realVals.get(i).value(), replayVals.get(i).value())) {
-                var div = new JsonObject();
-                div.addProperty("entry", real);
-                div.addProperty("timestamp", realVals.get(i).timestamp());
-                return div;
+            // Compare by matching timestamps (within 1ms tolerance) rather than
+            // by array index, since Real and Replay entries may have different
+            // sample counts or logging rates.
+            int replayIdx = 0;
+            double tolerance = 0.001; // 1ms
+            for (var realTv : realVals) {
+              // Advance replay index to find matching timestamp
+              while (replayIdx < replayVals.size()
+                  && replayVals.get(replayIdx).timestamp() < realTv.timestamp() - tolerance) {
+                replayIdx++;
+              }
+              if (replayIdx >= replayVals.size()) break;
+
+              var replayTv = replayVals.get(replayIdx);
+              if (Math.abs(replayTv.timestamp() - realTv.timestamp()) <= tolerance) {
+                if (!Objects.equals(realTv.value(), replayTv.value())) {
+                  var div = new JsonObject();
+                  div.addProperty("entry", real);
+                  div.addProperty("timestamp", realTv.timestamp());
+                  return div;
+                }
               }
             }
             return null;
@@ -1151,6 +1339,18 @@ public final class FrcDomainTools {
       result.addProperty("success", true);
       result.addProperty("divergent_count", divergent.size());
       result.add("divergences", GSON.toJsonTree(divergent.stream().limit(10).toList()));
+
+      // Add data quality from first real entry if available
+      if (!realEntries.isEmpty()) {
+        var firstVals = log.values().get(realEntries.get(0));
+        if (firstVals != null && !firstVals.isEmpty()) {
+          var quality = DataQuality.fromValues(firstVals);
+          var directives = AnalysisDirectives.fromQuality(quality).addSingleMatchCaveat();
+          result.add("data_quality", quality.toJson());
+          result.add("server_analysis_directives", directives.toJson());
+        }
+      }
+
       return result;
     }
   }
@@ -1162,22 +1362,27 @@ public final class FrcDomainTools {
     @Override
     public String description() {
       return "Detect when robot code exceeded loop period threshold (default 20ms). "
-          + "Returns violations, statistics, and a health score.";
+          + "Returns violations, statistics, and a health score. "
+          + "Auto-detects units (ms vs s) via median heuristic; assumes standard FRC loop rates."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addNumberProperty("threshold_ms", "Loop time threshold in milliseconds (default: 20)", false, 20.0)
           .addNumberProperty("start_time", "Start timestamp in seconds", false, null)
           .addNumberProperty("end_time", "End timestamp in seconds", false, null)
+          .addProperty("unit", "string", "Unit of loop time values: 'ms', 's', or 'auto' (default: 'auto'). "
+              + "Auto-detect uses median value: if median < 1.0, assumes seconds and converts to ms.", false)
           .build();
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {double thresholdMs = getOptDouble(arguments, "threshold_ms", 20.0);
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {double thresholdMs = getOptDouble(arguments, "threshold_ms", 20.0);
       var startTime = getOptDouble(arguments, "start_time");
       var endTime = getOptDouble(arguments, "end_time");
+      var unit = getOptString(arguments, "unit", "auto");
 
       // Find loop time entry
       String loopTimeEntry = null;
@@ -1201,32 +1406,51 @@ public final class FrcDomainTools {
       var violations = new ArrayList<JsonObject>();
       var loopTimes = new ArrayList<Double>();
 
+      // Determine conversion factor based on unit parameter
+      // For "auto", collect raw values first, then detect unit from median
+      boolean needsAutoDetect = "auto".equalsIgnoreCase(unit);
+      double conversionFactor = 1.0; // default: assume ms
+      if ("s".equalsIgnoreCase(unit)) {
+        conversionFactor = 1000.0;
+      }
+
+      // First pass: collect raw values with timestamps for auto-detection
+      record RawSample(double timestamp, double value) {}
+      var rawSamples = new ArrayList<RawSample>();
       for (TimestampedValue tv : values) {
         if (startTime != null && tv.timestamp() < startTime) continue;
         if (endTime != null && tv.timestamp() > endTime) break;
-
         if (tv.value() instanceof Number num) {
-          double loopTimeMs = num.doubleValue();
-
-          // Convert to ms if it looks like it's in seconds (< 1.0 but > 0)
-          if (loopTimeMs < 1.0 && loopTimeMs > 0) {
-            loopTimeMs *= 1000.0;
-          }
-
-          loopTimes.add(loopTimeMs);
-
-          if (loopTimeMs > thresholdMs) {
-            var violation = new JsonObject();
-            violation.addProperty("timestamp", tv.timestamp());
-            violation.addProperty("loop_time_ms", loopTimeMs);
-            violation.addProperty("overage_ms", loopTimeMs - thresholdMs);
-            violations.add(violation);
-          }
+          rawSamples.add(new RawSample(tv.timestamp(), num.doubleValue()));
         }
       }
 
-      if (loopTimes.isEmpty()) {
+      if (rawSamples.isEmpty()) {
         return errorResult("No numeric loop time data found");
+      }
+
+      if (needsAutoDetect) {
+        // Use median to determine unit (robust to outliers)
+        var sortedRaw = rawSamples.stream().mapToDouble(RawSample::value).sorted().toArray();
+        double median = sortedRaw[sortedRaw.length / 2];
+        // Values in 0.001–1.0 range look like seconds (typical: 0.02 for 20ms loop)
+        // Below 0.001 could be fractional ms or corrupt data — leave as-is
+        if (median >= 0.001 && median < 1.0) {
+          conversionFactor = 1000.0; // Values look like seconds, convert to ms
+        }
+      }
+
+      for (var sample : rawSamples) {
+        double loopTimeMs = sample.value() * conversionFactor;
+        loopTimes.add(loopTimeMs);
+
+        if (loopTimeMs > thresholdMs) {
+          var violation = new JsonObject();
+          violation.addProperty("timestamp", sample.timestamp());
+          violation.addProperty("loop_time_ms", loopTimeMs);
+          violation.addProperty("overage_ms", loopTimeMs - thresholdMs);
+          violations.add(violation);
+        }
       }
 
       // Calculate statistics
@@ -1237,12 +1461,13 @@ public final class FrcDomainTools {
       statistics.addProperty("avg_ms", stats.getAverage());
       statistics.addProperty("max_ms", stats.getMax());
       statistics.addProperty("min_ms", stats.getMin());
-      statistics.addProperty("p95_ms", sorted[(int) (sorted.length * 0.95)]);
-      statistics.addProperty("p99_ms", sorted[(int) (sorted.length * 0.99)]);
+      statistics.addProperty("p95_ms", interpolatedPercentile(sorted, 0.95));
+      statistics.addProperty("p99_ms", interpolatedPercentile(sorted, 0.99));
 
       // Calculate health score (0-100)
       double violationRate = (double) violations.size() / loopTimes.size();
-      int healthScore = (int) Math.max(0, Math.min(100, 100 - (violationRate * 200)));
+      // Linear mapping: 0% violations = 100, 100% violations = 0
+      int healthScore = (int) Math.max(0, Math.min(100, 100 - (violationRate * 100)));
 
       var result = new JsonObject();
       result.addProperty("success", true);
@@ -1255,6 +1480,14 @@ public final class FrcDomainTools {
       result.add("statistics", statistics);
       result.add("violations", GSON.toJsonTree(violations.stream().limit(50).toList()));
 
+      // Add data quality and analysis directives
+      var quality = DataQuality.fromValues(values);
+      var directives = AnalysisDirectives.fromQuality(quality)
+          .addSingleMatchCaveat()
+          .addGuidance("Health score is a heuristic based on violation rate — consider context of violations");
+      result.add("data_quality", quality.toJson());
+      result.add("server_analysis_directives", directives.toJson());
+
       return result;
     }
   }
@@ -1266,11 +1499,12 @@ public final class FrcDomainTools {
     @Override
     public String description() {
       return "Analyze CAN bus health: detect bus-off events, high utilization, and noisy devices. "
-          + "Returns 'no CAN bus data found' if log does not contain CAN utilization or error entries.";
+          + "Returns 'no CAN bus data found' if log does not contain CAN utilization or error entries."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("bus_name", "string", "CAN bus name (default: 'rio')", false)
           .addNumberProperty("start_time", "Start timestamp in seconds", false, null)
@@ -1279,7 +1513,7 @@ public final class FrcDomainTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(ParsedLog log, JsonObject arguments) throws Exception {var busName = getOptString(arguments, "bus_name", "rio");
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {var busName = getOptString(arguments, "bus_name", "rio");
       var startTime = getOptDouble(arguments, "start_time");
       var endTime = getOptDouble(arguments, "end_time");
 
@@ -1318,7 +1552,7 @@ public final class FrcDomainTools {
           var utilData = new ArrayList<Double>();
           for (TimestampedValue tv : values) {
             if (startTime != null && tv.timestamp() < startTime) continue;
-            if (endTime != null && tv.timestamp() > endTime) break;
+            if (endTime != null && tv.timestamp() > endTime) continue;
 
             if (tv.value() instanceof Number num) {
               utilData.add(num.doubleValue());
@@ -1338,45 +1572,104 @@ public final class FrcDomainTools {
         result.add("utilization", GSON.toJsonTree(utilAnalysis));
       }
 
-      // Analyze errors
+      // Find DriverStation Enabled entry for cross-referencing
+      List<TimestampedValue> enabledValues = null;
+      for (var entryName : log.entries().keySet()) {
+        var lower = lowerEntryNames.get(entryName);
+        if (lower.contains("driverstation") && lower.contains("enabled")) {
+          enabledValues = log.values().get(entryName);
+          break;
+        }
+      }
+
+      // Analyze errors, distinguishing enabled vs disabled state
       if (!canErrorEntries.isEmpty()) {
         var errorAnalysis = new ArrayList<JsonObject>();
+        boolean hasDsData = enabledValues != null && !enabledValues.isEmpty();
+
+        if (!hasDsData) {
+          result.addProperty("ds_enabled_warning",
+              "No DriverStation Enabled entry found — cannot distinguish enabled vs disabled CAN errors. All errors counted.");
+        }
+
         for (var entryName : canErrorEntries) {
           var values = log.values().get(entryName);
           if (values == null) continue;
 
-          int errorCount = 0;
+          int errorsWhileEnabled = 0;
+          int errorsWhileDisabled = 0;
           for (TimestampedValue tv : values) {
             if (startTime != null && tv.timestamp() < startTime) continue;
-            if (endTime != null && tv.timestamp() > endTime) break;
+            if (endTime != null && tv.timestamp() > endTime) continue;
 
             // Count non-zero errors or true boolean errors
+            boolean isError = false;
             if (tv.value() instanceof Boolean b && b) {
-              errorCount++;
+              isError = true;
             } else if (tv.value() instanceof Number num && num.doubleValue() > 0) {
-              errorCount++;
+              isError = true;
+            }
+
+            if (isError) {
+              if (hasDsData) {
+                if (ToolUtils.isEnabledAt(enabledValues, tv.timestamp())) {
+                  errorsWhileEnabled++;
+                } else {
+                  errorsWhileDisabled++;
+                }
+              } else {
+                errorsWhileEnabled++; // Count all as enabled when no DS data
+              }
             }
           }
 
-          if (errorCount > 0) {
+          int totalErrors = errorsWhileEnabled + errorsWhileDisabled;
+          if (totalErrors > 0) {
             var analysis = new JsonObject();
             analysis.addProperty("entry", entryName);
-            analysis.addProperty("error_count", errorCount);
+            analysis.addProperty("error_count", totalErrors);
+            analysis.addProperty("errors_while_enabled", errorsWhileEnabled);
+            analysis.addProperty("errors_while_disabled", errorsWhileDisabled);
             errorAnalysis.add(analysis);
           }
         }
         result.add("errors", GSON.toJsonTree(errorAnalysis));
+
+        // Base health assessment on enabled-state errors only
+        int totalEnabledErrors = errorAnalysis.stream()
+            .mapToInt(a -> a.get("errors_while_enabled").getAsInt()).sum();
+        result.addProperty("enabled_error_total", totalEnabledErrors);
+        if (totalEnabledErrors == 0 && !errorAnalysis.isEmpty()) {
+          result.addProperty("assessment", "CAN errors only during disabled state — likely normal timeout behavior");
+        } else if (totalEnabledErrors > 0) {
+          result.addProperty("assessment", "CAN errors detected while robot was enabled — investigate device connections");
+        }
       }
 
       if (canUtilEntries.isEmpty() && canErrorEntries.isEmpty()) {
         result.addProperty("warning", "No CAN-related entries found in log");
       }
 
+      // Add data quality from first CAN utilization or error entry
+      var canQualityEntry = !canUtilEntries.isEmpty() ? canUtilEntries.get(0)
+          : (!canErrorEntries.isEmpty() ? canErrorEntries.get(0) : null);
+      if (canQualityEntry != null) {
+        var qVals = log.values().get(canQualityEntry);
+        if (qVals != null && !qVals.isEmpty()) {
+          var quality = DataQuality.fromValues(qVals);
+          var directives = AnalysisDirectives.fromQuality(quality)
+              .addSingleMatchCaveat()
+              .addGuidance("Disabled-state CAN timeouts are normal — focus on enabled-state errors");
+          result.add("data_quality", quality.toJson());
+          result.add("server_analysis_directives", directives.toJson());
+        }
+      }
+
       return result;
     }
   }
 
-  static class PredictBatteryHealthTool extends ToolBase {
+  static class PredictBatteryHealthTool extends LogRequiringTool {
     @Override
     public String name() {
       return "predict_battery_health";
@@ -1386,28 +1679,28 @@ public final class FrcDomainTools {
     public String description() {
       return "Analyze battery voltage and current draw to predict brownout risk and estimate "
           + "battery health. Returns health score (0-100), brownout risk level (MINIMAL/LOW/"
-          + "MODERATE/HIGH/CRITICAL), voltage statistics, and actionable recommendations.";
+          + "MODERATE/HIGH/CRITICAL), voltage statistics, and actionable recommendations."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_POWER;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addNumberProperty("start_time", "Start timestamp in seconds", false, null)
           .addNumberProperty("end_time", "End timestamp in seconds", false, null)
           .addNumberProperty("nominal_voltage", "Expected full battery voltage (default: 12.6V)", false, 12.6)
-          .addNumberProperty("brownout_threshold", "Brownout voltage threshold (default: 7.0V)", false, 7.0)
+          .addNumberProperty("brownout_threshold", "Brownout voltage threshold (default: 6.8V for roboRIO 1, use 6.3V for roboRIO 2)", false, 6.8)
           .addNumberProperty("warning_threshold", "Warning voltage threshold (default: 9.0V)", false, 9.0)
           .build();
     }
 
     @Override
-    protected JsonElement executeInternal(JsonObject arguments) throws Exception {
-      var log = requireActiveLog();
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
       var startTime = getOptDouble(arguments, "start_time");
       var endTime = getOptDouble(arguments, "end_time");
       double nominalVoltage = getOptDouble(arguments, "nominal_voltage", 12.6);
-      double brownoutThreshold = getOptDouble(arguments, "brownout_threshold", 7.0);
+      double brownoutThreshold = getOptDouble(arguments, "brownout_threshold", 6.8);
       double warningThreshold = getOptDouble(arguments, "warning_threshold", 9.0);
 
       // Find voltage and current entries
@@ -1438,7 +1731,7 @@ public final class FrcDomainTools {
           warningThreshold);
     }
 
-    private String findVoltageEntry(ParsedLog log) {
+    private String findVoltageEntry(LogData log) {
       // Try common voltage entry patterns
       var patterns = java.util.List.of(
           "batteryvoltage",
@@ -1455,7 +1748,7 @@ public final class FrcDomainTools {
       return null;
     }
 
-    private String findCurrentEntry(ParsedLog log) {
+    private String findCurrentEntry(LogData log) {
       var patterns = java.util.List.of(
           "totalcurrent",
           "total_current",
@@ -1550,6 +1843,12 @@ public final class FrcDomainTools {
         response.addWarning("Battery health is poor - replace before next match");
       }
 
+      var quality = DataQuality.fromValues(voltageValues);
+      var directives = AnalysisDirectives.fromQuality(quality)
+          .addSingleMatchCaveat()
+          .addGuidance("Battery health score is a heuristic — consider battery age and connector condition");
+      response.addDataQuality(quality).addDirectives(directives);
+
       return response.build();
     }
 
@@ -1565,6 +1864,8 @@ public final class FrcDomainTools {
         var voltage = toDouble(tv.value());
         if (voltage == null) continue;
 
+        // Hysteresis: enter below threshold, exit only above threshold + 0.2V
+        double hysteresis = 0.2;
         if (voltage < threshold && !inEvent) {
           // Event started
           inEvent = true;
@@ -1573,7 +1874,7 @@ public final class FrcDomainTools {
         } else if (voltage < threshold && inEvent) {
           // Event continuing
           eventMinVoltage = Math.min(eventMinVoltage, voltage);
-        } else if (voltage >= threshold && inEvent) {
+        } else if (voltage >= threshold + hysteresis && inEvent) {
           // Event ended
           var event = new JsonObject();
           event.addProperty("start_time", eventStartTime);
@@ -1583,6 +1884,17 @@ public final class FrcDomainTools {
           events.add(event);
           inEvent = false;
         }
+      }
+
+      // Emit open-ended event if voltage was still below threshold at end of log
+      if (inEvent && !voltageValues.isEmpty()) {
+        double lastTime = voltageValues.get(voltageValues.size() - 1).timestamp();
+        var event = new JsonObject();
+        event.addProperty("start_time", eventStartTime);
+        event.addProperty("end_time", lastTime);
+        event.addProperty("duration", lastTime - eventStartTime);
+        event.addProperty("min_voltage", eventMinVoltage);
+        events.add(event);
       }
 
       return events;
@@ -1599,7 +1911,8 @@ public final class FrcDomainTools {
       // Find load changes (significant voltage drops)
       var recoveryTimes = new ArrayList<Double>();
 
-      for (int i = 1; i < voltageValues.size() - 10 && i < 1000; i++) {
+      // Scan all voltage samples (no arbitrary limit — supports any logging rate)
+      for (int i = 1; i < voltageValues.size() - 10; i++) {
         var voltageBefore = toDouble(voltageValues.get(i - 1).value());
         var voltageAtLoad = toDouble(voltageValues.get(i).value());
 
@@ -1612,11 +1925,12 @@ public final class FrcDomainTools {
           double dropTime = voltageValues.get(i).timestamp();
           double recoveryTarget = voltageAtLoad + (voltageDrop * 0.9);  // 90% recovery
 
-          for (int j = i + 1; j < Math.min(i + 20, voltageValues.size()); j++) {
+          for (int j = i + 1; j < voltageValues.size(); j++) {
+            double elapsed = voltageValues.get(j).timestamp() - dropTime;
+            if (elapsed > 2.0) break; // 2-second recovery window
             var recoveredVoltage = toDouble(voltageValues.get(j).value());
             if (recoveredVoltage != null && recoveredVoltage >= recoveryTarget) {
-              double recoveryTime = voltageValues.get(j).timestamp() - dropTime;
-              recoveryTimes.add(recoveryTime);
+              recoveryTimes.add(elapsed);
               break;
             }
           }
@@ -1637,6 +1951,23 @@ public final class FrcDomainTools {
       return analysis;
     }
 
+    /**
+     * Calculates a battery health score (0-100) from voltage characteristics.
+     *
+     * <p>Scoring formula (empirical, not derived from battery specs):
+     * <ul>
+     *   <li>Start at 100</li>
+     *   <li>Avg voltage below 88% of nominal (≈11.1V on 12.6V): −(deficit × 150)</li>
+     *   <li>Each brownout event: −20</li>
+     *   <li>Each warning-level sag event: −5</li>
+     *   <li>Slow recovery (>0.5s avg): −(excess × 20)</li>
+     *   <li>Min voltage below 10V: −(deficit × 10)</li>
+     * </ul>
+     *
+     * <p>Note: This score provides useful relative ranking between batteries but
+     * absolute values should not be the sole basis for replacement decisions.
+     * Factors like battery age, connector condition, and wire gauge also matter.
+     */
     private int calculateHealthScore(
         double avgVoltage,
         double nominalVoltage,
@@ -1645,19 +1976,19 @@ public final class FrcDomainTools {
         int sagEvents,
         JsonObject recoveryAnalysis) {
 
-      // Start at 100
       int score = 100;
 
-      // Deduct for low average voltage
-      double voltageRatio = avgVoltage / nominalVoltage;
-      if (voltageRatio < 0.95) {
-        score -= (int) ((0.95 - voltageRatio) * 200);
+      // Avg voltage penalty: 88% threshold (≈11.1V on 12.6V nominal).
+      // Healthy FRC batteries routinely sag to 11.0–11.5V under match load.
+      double voltageRatio = nominalVoltage > 0 ? avgVoltage / nominalVoltage : 1.0;
+      if (voltageRatio < 0.88) {
+        score -= (int) ((0.88 - voltageRatio) * 150);
       }
 
-      // Deduct heavily for brownouts
+      // Brownout penalty: 20 pts each — indicates serious power delivery issues
       score -= brownoutEvents * 20;
 
-      // Deduct for warning-level sags
+      // Warning-level sag penalty: 5 pts each — cumulative indicator
       score -= sagEvents * 5;
 
       // Deduct for poor recovery time (high internal resistance)

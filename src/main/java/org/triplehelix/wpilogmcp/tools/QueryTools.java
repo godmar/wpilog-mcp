@@ -7,7 +7,7 @@ import java.util.ArrayList;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.triplehelix.wpilogmcp.log.EntryInfo;
-import org.triplehelix.wpilogmcp.mcp.McpServer;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
 import org.triplehelix.wpilogmcp.mcp.McpServer.SchemaBuilder;
 
 import static org.triplehelix.wpilogmcp.tools.ToolUtils.*;
@@ -30,11 +30,11 @@ public final class QueryTools {
   /**
    * Registers all query tools with the MCP server.
    */
-  public static void registerAll(McpServer server) {
-    server.registerTool(new SearchEntriesTool());
-    server.registerTool(new GetTypesTool());
-    server.registerTool(new FindConditionTool());
-    server.registerTool(new SearchStringsTool());
+  public static void registerAll(ToolRegistry registry) {
+    registry.registerTool(new SearchEntriesTool());
+    registry.registerTool(new GetTypesTool());
+    registry.registerTool(new FindConditionTool());
+    registry.registerTool(new SearchStringsTool());
   }
 
   static class SearchEntriesTool extends LogRequiringTool {
@@ -49,7 +49,7 @@ public final class QueryTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty(
               "type", "string", "Filter by type (substring match, e.g., 'Pose3d')", false)
@@ -59,13 +59,13 @@ public final class QueryTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.LogData log, JsonObject arguments) throws Exception {
       var typeFilter =
-          arguments.has("type") ? arguments.get("type").getAsString() : null;
+          arguments.has("type") && !arguments.get("type").isJsonNull() ? arguments.get("type").getAsString() : null;
       var nameContains =
-          arguments.has("pattern") ? arguments.get("pattern").getAsString() : null;
+          arguments.has("pattern") && !arguments.get("pattern").isJsonNull() ? arguments.get("pattern").getAsString() : null;
       var minSamples =
-          arguments.has("min_samples") ? arguments.get("min_samples").getAsInt() : null;
+          arguments.has("min_samples") && !arguments.get("min_samples").isJsonNull() ? arguments.get("min_samples").getAsInt() : null;
 
       var matches = new ArrayList<String>();
 
@@ -105,12 +105,12 @@ public final class QueryTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder().build();
     }
 
     @Override
-    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.LogData log, JsonObject arguments) throws Exception {
       var byType = log.entries().values().stream()
           .collect(Collectors.groupingBy(
               EntryInfo::type,
@@ -148,7 +148,7 @@ public final class QueryTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("name", "string", "Entry name (e.g., /Robot/BatteryVoltage)", true)
           .addProperty(
@@ -162,7 +162,7 @@ public final class QueryTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.LogData log, JsonObject arguments) throws Exception {
       var name = arguments.get("name").getAsString();
       var operator = arguments.get("operator").getAsString();
       double threshold = arguments.get("threshold").getAsDouble();
@@ -221,8 +221,8 @@ public final class QueryTools {
         case "lte", "<=" -> value <= threshold;
         case "gt", ">" -> value > threshold;
         case "gte", ">=" -> value >= threshold;
-        case "eq", "==" -> Math.abs(value - threshold) < 0.0001;
-        default -> false;
+        case "eq", "==" -> Math.abs(value - threshold) <= Math.max(1e-9, Math.abs(threshold) * 1e-6);
+        default -> throw new IllegalArgumentException("Unknown operator: " + operator + ". Valid operators: lt, <, lte, <=, gt, >, gte, >=, eq, ==");
       };
     }
 
@@ -252,7 +252,7 @@ public final class QueryTools {
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty(
               "pattern",
@@ -269,7 +269,7 @@ public final class QueryTools {
     }
 
     @Override
-    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.ParsedLog log, JsonObject arguments) throws Exception {
+    protected JsonElement executeWithLog(org.triplehelix.wpilogmcp.log.LogData log, JsonObject arguments) throws Exception {
       var pattern = arguments.get("pattern").getAsString().toLowerCase();
       var entryPattern = arguments.has("entry_pattern") && !arguments.get("entry_pattern").isJsonNull()
           ? arguments.get("entry_pattern").getAsString().toLowerCase()

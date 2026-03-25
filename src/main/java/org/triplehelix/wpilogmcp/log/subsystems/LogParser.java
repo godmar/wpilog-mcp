@@ -61,7 +61,7 @@ public class LogParser {
     var valuesByEntry = new HashMap<String, java.util.List<TimestampedValue>>();
 
     double minTimestamp = Double.MAX_VALUE;
-    double maxTimestamp = Double.MIN_VALUE;
+    double maxTimestamp = Double.NEGATIVE_INFINITY;
     boolean truncated = false;
     var truncationMessage = (String) null;
 
@@ -109,7 +109,11 @@ public class LogParser {
         }
       }
     } catch (IllegalArgumentException e) {
-      if (e.getMessage() != null && e.getMessage().contains("capacity")) {
+      // WPILib throws IllegalArgumentException with "capacity" for truncated logs.
+      // Include fallback match strings in case the message wording changes.
+      String msg = e.getMessage();
+      if (msg != null && (msg.contains("capacity") || msg.contains("truncat")
+              || msg.contains("incomplete") || msg.contains("buffer"))) {
         truncated = true;
         truncationMessage =
             "Log file is truncated (incomplete write). Data up to "
@@ -128,41 +132,19 @@ public class LogParser {
         entriesByName,
         valuesByEntry,
         minTimestamp == Double.MAX_VALUE ? 0 : minTimestamp,
-        maxTimestamp == Double.MIN_VALUE ? 0 : maxTimestamp,
+        maxTimestamp == Double.NEGATIVE_INFINITY ? 0 : maxTimestamp,
         truncated,
         truncationMessage);
   }
 
   /**
-   * Decodes a value from a DataLogRecord based on its type.
-   *
-   * <p>Handles primitive types directly and delegates struct decoding to the registry.
-   *
-   * @param record The log record
-   * @param type The entry type
-   * @return The decoded value
+   * Gets the struct decoder registry (for use by LazyParsedLog).
    */
+  public StructDecoderRegistry getDecoderRegistry() {
+    return decoderRegistry;
+  }
+
   private Object decodeValue(DataLogRecord record, String type) {
-    return switch (type) {
-      case "boolean" -> record.getBoolean();
-      case "int64" -> record.getInteger();
-      case "float" -> record.getFloat();
-      case "double" -> record.getDouble();
-      case "string", "json" -> record.getString();
-      case "boolean[]" -> record.getBooleanArray();
-      case "int64[]" -> record.getIntegerArray();
-      case "float[]" -> record.getFloatArray();
-      case "double[]" -> record.getDoubleArray();
-      case "string[]" -> record.getStringArray();
-      case "raw" -> record.getRaw();
-      default -> {
-        if (type.startsWith("struct:") || type.startsWith("structarray:")) {
-          byte[] raw = record.getRaw();
-          yield decoderRegistry.decodeStruct(type, raw);
-        }
-        byte[] raw = record.getRaw();
-        yield raw.length <= 100 ? BinaryReader.bytesToHex(raw) : "<" + raw.length + " bytes>";
-      }
-    };
+    return EntryDecoder.decodeValue(record, type, decoderRegistry);
   }
 }

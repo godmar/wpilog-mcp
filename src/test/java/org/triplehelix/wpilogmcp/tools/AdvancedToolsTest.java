@@ -11,8 +11,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.triplehelix.wpilogmcp.mcp.McpServer;
-import org.triplehelix.wpilogmcp.mcp.McpServer.Tool;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry.Tool;
 
 /**
  * Tests for advanced WPILOG analysis tools.
@@ -26,8 +26,8 @@ class AdvancedToolsTest {
     registeredTools = new ArrayList<>();
 
     // Capture registered tools
-    var capturingServer =
-        new McpServer() {
+    var capturingRegistry =
+        new ToolRegistry() {
           @Override
           public void registerTool(Tool tool) {
             registeredTools.add(tool);
@@ -35,7 +35,7 @@ class AdvancedToolsTest {
           }
         };
 
-    WpilogTools.registerAll(capturingServer);
+    WpilogTools.registerAll(capturingRegistry);
   }
 
   private Tool findTool(String name) {
@@ -77,10 +77,11 @@ class AdvancedToolsTest {
     @Test
     @DisplayName("total tool count is correct")
     void totalToolCountIsCorrect() {
-      // Core(11) + Query(4) + Statistics(6) + RobotAnalysis(7) + FrcDomain(9) + Export(2) + TBA(1) = 40 total
-      // FrcDomain tools: get_ds_timeline, analyze_vision, profile_mechanism, analyze_auto,
-      // analyze_cycles, analyze_replay_drift, analyze_loop_timing, analyze_can_bus, predict_battery_health
-      assertEquals(40, registeredTools.size());
+      // Core(8) + Query(4) + Statistics(6) + RobotAnalysis(7) + FrcDomain(9) + Export(2) + TBA(2) + RevLog(5) + Discovery(2) = 45 total
+      // Core tools: list_available_logs, list_entries, get_entry_info, read_entry,
+      //   list_loaded_logs, list_struct_types, health_check, get_game_info
+      // (load_log, set_active_log, unload_log, unload_all_logs removed in path-per-call refactor)
+      assertEquals(45, registeredTools.size());
     }
   }
 
@@ -125,14 +126,15 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var args = new JsonObject();
       args.addProperty("name", "/Test/Entry");
       var result = detectAnomaliesTool.execute(args);
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());
-      assertTrue(result.getAsJsonObject().get("error").getAsString().contains("No log"));
+      assertTrue(result.getAsJsonObject().get("error").getAsString().contains("path"),
+          "Should report missing path parameter: " + result.getAsJsonObject().get("error").getAsString());
     }
 
     @Test
@@ -155,15 +157,16 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has no required parameters")
-    void hasNoRequiredParameters() {
+    @DisplayName("has path as only tool-independent required parameter")
+    void hasPathRequired() {
       var schema = getMatchPhasesTool.inputSchema();
-      assertFalse(schema.has("required") && schema.getAsJsonArray("required").size() > 0);
+      assertTrue(schema.has("required"));
+      assertTrue(schema.getAsJsonArray("required").toString().contains("path"));
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var result = getMatchPhasesTool.execute(new JsonObject());
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());
@@ -209,17 +212,17 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has optional prominence parameter")
-    void hasOptionalProminenceParameter() {
+    @DisplayName("has optional min_height_diff parameter")
+    void hasOptionalMinHeightDiffParameter() {
       var schema = findPeaksTool.inputSchema();
       var properties = schema.getAsJsonObject("properties");
 
-      assertTrue(properties.has("prominence"));
+      assertTrue(properties.has("min_height_diff"));
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var args = new JsonObject();
       args.addProperty("name", "/Test/Entry");
       var result = findPeaksTool.execute(args);
@@ -297,7 +300,7 @@ class AdvancedToolsTest {
 
       assertTrue(properties.has("name1"));
       assertTrue(properties.has("name2"));
-      assertEquals(2, required.size());
+      assertEquals(3, required.size()); // name1, name2, path
     }
 
     @Test
@@ -308,8 +311,8 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var args = new JsonObject();
       args.addProperty("name1", "/Entry1");
       args.addProperty("name2", "/Entry2");
@@ -340,10 +343,11 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has no required parameters")
-    void hasNoRequiredParameters() {
+    @DisplayName("has path as only tool-independent required parameter")
+    void hasPathRequired() {
       var schema = analyzeSwerveTool.inputSchema();
-      assertFalse(schema.has("required") && schema.getAsJsonArray("required").size() > 0);
+      assertTrue(schema.has("required"));
+      assertTrue(schema.getAsJsonArray("required").toString().contains("path"));
     }
 
     @Test
@@ -375,13 +379,13 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has brownout_threshold parameter with default 7.0")
+    @DisplayName("has brownout_threshold parameter with default 6.8")
     void hasBrownoutThresholdParameter() {
       var schema = powerAnalysisTool.inputSchema();
       var properties = schema.getAsJsonObject("properties");
 
       assertTrue(properties.has("brownout_threshold"));
-      assertEquals(7.0, properties.getAsJsonObject("brownout_threshold").get("default").getAsDouble());
+      assertEquals(6.8, properties.getAsJsonObject("brownout_threshold").get("default").getAsDouble());
     }
 
     @Test
@@ -404,15 +408,16 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has no required parameters")
-    void hasNoRequiredParameters() {
+    @DisplayName("has path as only tool-independent required parameter")
+    void hasPathRequired() {
       var schema = canHealthTool.inputSchema();
-      assertFalse(schema.has("required") && schema.getAsJsonArray("required").size() > 0);
+      assertTrue(schema.has("required"));
+      assertTrue(schema.getAsJsonArray("required").toString().contains("path"));
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var result = canHealthTool.execute(new JsonObject());
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());
@@ -448,14 +453,14 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("returns error when less than 2 logs loaded")
-    void returnsErrorWhenNotEnoughLogs() throws Exception {
+    @DisplayName("returns error when missing required parameters")
+    void returnsErrorWhenMissingParams() throws Exception {
       var args = new JsonObject();
       args.addProperty("name", "/Test/Entry");
+      // Missing path and compare_path
       var result = compareMatchesTool.execute(args);
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());
-      assertTrue(result.getAsJsonObject().get("error").getAsString().contains("at least 2 logs"));
     }
 
     @Test
@@ -478,15 +483,16 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has no required parameters")
-    void hasNoRequiredParameters() {
+    @DisplayName("has path as only tool-independent required parameter")
+    void hasPathRequired() {
       var schema = getCodeMetadataTool.inputSchema();
-      assertFalse(schema.has("required") && schema.getAsJsonArray("required").size() > 0);
+      assertTrue(schema.has("required"));
+      assertTrue(schema.getAsJsonArray("required").toString().contains("path"));
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var result = getCodeMetadataTool.execute(new JsonObject());
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());
@@ -563,15 +569,16 @@ class AdvancedToolsTest {
     }
 
     @Test
-    @DisplayName("has no required parameters")
-    void hasNoRequiredParameters() {
+    @DisplayName("has path as only tool-independent required parameter")
+    void hasPathRequired() {
       var schema = generateReportTool.inputSchema();
-      assertFalse(schema.has("required") && schema.getAsJsonArray("required").size() > 0);
+      assertTrue(schema.has("required"));
+      assertTrue(schema.getAsJsonArray("required").toString().contains("path"));
     }
 
     @Test
-    @DisplayName("returns error when no log loaded")
-    void returnsErrorWhenNoLogLoaded() throws Exception {
+    @DisplayName("returns error when path not provided")
+    void returnsErrorWhenPathNotProvided() throws Exception {
       var result = generateReportTool.execute(new JsonObject());
 
       assertFalse(result.getAsJsonObject().get("success").getAsBoolean());

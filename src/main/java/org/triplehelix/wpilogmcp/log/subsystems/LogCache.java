@@ -1,307 +1,221 @@
 package org.triplehelix.wpilogmcp.log.subsystems;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.triplehelix.wpilogmcp.log.ParsedLog;
+import org.triplehelix.wpilogmcp.log.LogData;
 
 /**
- * Thread-safe LRU cache for parsed robot logs with memory-based and count-based eviction.
+ * Thread-safe LRU cache for loaded log files, backed by Caffeine.
  *
- * <p>This cache maintains a fixed maximum number of loaded logs and/or maximum memory usage. When
- * limits are exceeded, the least recently used log is evicted (unless it's the active log).
+ * <p>Eviction is driven by:
+ * <ul>
+ *   <li><b>Idle time</b> — entries expire after 30 minutes of inactivity (configurable)
+ *   <li><b>Heap pressure</b> — when free heap drops below 15% of max, LRU entries are evicted
+ * </ul>
  *
- * <p>Uses LinkedHashMap with access-order for LRU behavior and ReentrantReadWriteLock for
- * thread-safe concurrent reads.
+ * <p>When a log is evicted, its {@link org.triplehelix.wpilogmcp.log.LazyParsedLog} is closed
+ * to release memory-mapped file resources, and an optional eviction callback is invoked.
+ *
+ * <p>No configuration is needed — the cache automatically adapts to available heap. Users
+ * control total capacity via {@code WPILOG_MAX_HEAP} (JVM heap size).
  *
  * @since 0.4.0
  */
 public class LogCache {
   private static final Logger logger = LoggerFactory.getLogger(LogCache.class);
 
-  private final Map<String, ParsedLog> cache;
-  private final ReentrantReadWriteLock cacheLock = new ReentrantReadWriteLock();
-  private final MemoryEstimator memoryEstimator;
+  /** Evict when free heap drops below this fraction of max heap. */
+  private static final double HEAP_PRESSURE_THRESHOLD = 0.15;
 
-  private volatile String activeLogPath;
-  private int maxLoadedLogs = 20;
-  private int maxMemoryMb = 2048;
+  /** Default idle expiration: 30 minutes. */
+  private static final long DEFAULT_IDLE_MS = 1_800_000;
 
-  /**
-   * Creates a new LogCache with the specified memory estimator.
-   *
-   * @param memoryEstimator The memory estimator for calculating cache memory usage
-   */
-  public LogCache(MemoryEstimator memoryEstimator) {
-    this.memoryEstimator = memoryEstimator;
-    // LinkedHashMap with access-order for LRU behavior
-    this.cache = new LinkedHashMap<>(16, 0.75f, true);
+  private final Cache<String, LogData> cache;
+
+  /** Optional callback invoked when a log is evicted, for cleaning up associated resources. */
+  private volatile java.util.function.Consumer<String> evictionCallback;
+
+  public LogCache() {
+    this(DEFAULT_IDLE_MS);
   }
 
   /**
-   * Sets the maximum number of logs to keep in cache.
+   * Creates a LogCache with a custom idle expiration (for testing).
    *
-   * @param maxLoadedLogs Maximum number of logs (must be > 0)
+   * @param idleMs Maximum idle time in milliseconds before automatic eviction
    */
-  public void setMaxLoadedLogs(int maxLoadedLogs) {
-    if (maxLoadedLogs <= 0) {
-      throw new IllegalArgumentException("maxLoadedLogs must be positive");
+  public LogCache(long idleMs) {
+    this.cache = Caffeine.newBuilder()
+        .expireAfterAccess(idleMs, TimeUnit.MILLISECONDS)
+        .removalListener(this::onRemoval)
+        .executor(Runnable::run) // Run removal listener synchronously (same thread)
+        .build();
+  }
+
+  /**
+   * Sets a callback to be invoked when a log is evicted from the cache.
+   *
+   * @param callback A consumer that receives the evicted log's path
+   */
+  public void setEvictionCallback(java.util.function.Consumer<String> callback) {
+    this.evictionCallback = callback;
+  }
+
+  /**
+   * Sets the maximum idle time before eviction.
+   *
+   * <p>Caffeine does not support changing expiration policy after construction,
+   * so this is a no-op retained for API compatibility. Use the constructor parameter instead.
+   *
+   * @param maxIdleMs Maximum idle time in milliseconds (ignored after construction)
+   * @deprecated Idle timeout is set at construction time via {@link #LogCache(long)}. This method is a no-op.
+   */
+  @Deprecated
+  public void setMaxIdleMs(long maxIdleMs) {
+    logger.debug("setMaxIdleMs({}) called — idle timeout is set at construction time", maxIdleMs);
+  }
+
+  /**
+   * Gets a cached log by path.
+   */
+  public LogData get(String path) {
+    return cache.getIfPresent(path);
+  }
+
+  /** Puts a log into the cache. */
+  public void put(String path, LogData log) {
+    cache.put(path, log);
+  }
+
+  /** Removes a log from the cache. Returns the removed log, or null. */
+  public LogData remove(String path) {
+    LogData removed = cache.getIfPresent(path);
+    if (removed != null) {
+      cache.invalidate(path);
     }
-    this.maxLoadedLogs = maxLoadedLogs;
-    logger.info("Max loaded logs set to: {}", maxLoadedLogs);
+    return removed;
   }
 
-  /**
-   * Sets the maximum memory usage in megabytes.
-   *
-   * @param maxMemoryMb Maximum memory in MB (must be > 0)
-   */
-  public void setMaxMemoryMb(int maxMemoryMb) {
-    if (maxMemoryMb <= 0) {
-      throw new IllegalArgumentException("maxMemoryMb must be positive");
-    }
-    this.maxMemoryMb = maxMemoryMb;
-    logger.info("Max memory set to: {} MB", maxMemoryMb);
-  }
-
-  /**
-   * Gets the currently active log path.
-   *
-   * @return The active log path, or null if none
-   */
-  public String getActiveLogPath() {
-    return activeLogPath;
-  }
-
-  /**
-   * Sets the currently active log path.
-   *
-   * @param activeLogPath The active log path
-   */
-  public void setActiveLogPath(String activeLogPath) {
-    this.activeLogPath = activeLogPath;
-  }
-
-  /**
-   * Gets a log from the cache.
-   *
-   * @param path The log file path
-   * @return The parsed log, or null if not in cache
-   */
-  public ParsedLog get(String path) {
-    cacheLock.readLock().lock();
-    try {
-      return cache.get(path);
-    } finally {
-      cacheLock.readLock().unlock();
-    }
-  }
-
-  /**
-   * Puts a log into the cache.
-   *
-   * @param path The log file path
-   * @param log The parsed log
-   */
-  public void put(String path, ParsedLog log) {
-    cacheLock.writeLock().lock();
-    try {
-      cache.put(path, log);
-      logger.debug("Added log to cache: {}", path);
-    } finally {
-      cacheLock.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Removes a log from the cache.
-   *
-   * @param path The log file path
-   * @return The removed log, or null if not in cache
-   */
-  public ParsedLog remove(String path) {
-    cacheLock.writeLock().lock();
-    try {
-      ParsedLog removed = cache.remove(path);
-      if (removed != null) {
-        logger.debug("Removed log from cache: {}", path);
-      }
-      return removed;
-    } finally {
-      cacheLock.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Clears all logs from the cache.
-   */
-  public void clear() {
-    cacheLock.writeLock().lock();
-    try {
-      cache.clear();
-      activeLogPath = null;
-      logger.info("Cleared all logs from cache");
-    } finally {
-      cacheLock.writeLock().unlock();
-    }
-  }
-
-  /**
-   * Gets the number of logs currently in cache.
-   *
-   * @return The cache size
-   */
-  public int size() {
-    cacheLock.readLock().lock();
-    try {
-      return cache.size();
-    } finally {
-      cacheLock.readLock().unlock();
-    }
-  }
-
-  /**
-   * Checks if a log is in the cache.
-   *
-   * @param path The log file path
-   * @return true if the log is cached
-   */
+  /** Checks if the cache contains a log. */
   public boolean containsKey(String path) {
-    cacheLock.readLock().lock();
-    try {
-      return cache.containsKey(path);
-    } finally {
-      cacheLock.readLock().unlock();
-    }
+    return cache.getIfPresent(path) != null;
+  }
+
+  /** Clears all entries, closing LazyParsedLog instances. */
+  public void clear() {
+    cache.invalidateAll();
+    // Force synchronous cleanup so removal listener runs before we return
+    cache.cleanUp();
   }
 
   /**
-   * Gets all log paths currently in cache.
+   * Evicts logs based on heap pressure and idle time.
    *
-   * @return List of all cached log paths
-   */
-  public java.util.List<String> getAllPaths() {
-    cacheLock.readLock().lock();
-    try {
-      return new java.util.ArrayList<>(cache.keySet());
-    } finally {
-      cacheLock.readLock().unlock();
-    }
-  }
-
-  /**
-   * Gets all entries currently in cache.
-   *
-   * @return Map of all cached entries (path -> ParsedLog)
-   */
-  public Map<String, ParsedLog> getAllEntries() {
-    cacheLock.readLock().lock();
-    try {
-      return new LinkedHashMap<>(cache);
-    } finally {
-      cacheLock.readLock().unlock();
-    }
-  }
-
-  /**
-   * Evicts logs if cache limits are exceeded.
-   *
-   * <p>Eviction strategy:
-   *
-   * <ul>
-   *   <li>Count-based: If cache size exceeds maxLoadedLogs, evict LRU log
-   *   <li>Memory-based: If estimated memory exceeds maxMemoryMb, evict LRU log
-   *   <li>Never evicts the active log
-   * </ul>
-   *
-   * After eviction, calls System.gc() to encourage release of memory-mapped buffers.
+   * <p>First triggers Caffeine's built-in idle expiration cleanup, then evicts LRU entries
+   * while JVM free heap is below the pressure threshold.
    */
   public void evictIfNeeded() {
-    cacheLock.writeLock().lock();
-    try {
-      // Check count-based eviction
-      if (cache.size() > maxLoadedLogs) {
-        evictLeastRecentlyUsed("count limit (" + maxLoadedLogs + ")");
-        return;
-      }
+    // Trigger pending idle expirations
+    cache.cleanUp();
 
-      // Check memory-based eviction
-      long estimatedMemoryBytes = memoryEstimator.estimateTotalMemory(cache.values());
-      long estimatedMemoryMb = estimatedMemoryBytes / (1024 * 1024);
-
-      if (estimatedMemoryMb > maxMemoryMb) {
-        logger.info(
-            "Estimated memory usage: {} MB (limit: {} MB) - evicting least recently used log",
-            estimatedMemoryMb,
-            maxMemoryMb);
-        evictLeastRecentlyUsed("memory limit (" + maxMemoryMb + " MB)");
+    // Evict LRU entries while under heap pressure
+    while (isUnderHeapPressure() && !cache.asMap().isEmpty()) {
+      if (!evictLeastRecentlyUsed("heap pressure")) {
+        break;
       }
-    } finally {
-      cacheLock.writeLock().unlock();
     }
   }
 
-  /**
-   * Evicts the least recently used log from the cache.
-   *
-   * <p>Internal method - assumes write lock is already held.
-   *
-   * @param reason The reason for eviction (for logging)
-   */
-  private void evictLeastRecentlyUsed(String reason) {
-    if (cache.isEmpty()) {
-      return;
-    }
-
-    // Find LRU entry (first entry in LinkedHashMap with access-order)
-    String pathToEvict = null;
-    for (String path : cache.keySet()) {
-      // Skip active log
-      if (path.equals(activeLogPath)) {
-        continue;
-      }
-      pathToEvict = path;
-      break; // First non-active entry is LRU
-    }
-
-    if (pathToEvict == null) {
-      logger.warn("Cannot evict: only active log remains in cache");
-      return;
-    }
-
-    cache.remove(pathToEvict);
-    logger.info("Evicted log '{}' due to {}", pathToEvict, reason);
-
-    // Suggest GC to release memory-mapped buffers
-    System.gc();
+  /** Evicts the least recently used log. Returns true if a log was evicted. */
+  public boolean evictOne() {
+    return evictLeastRecentlyUsed("making room for large file");
   }
 
-  /**
-   * Gets statistics about the cache.
-   *
-   * @return Map with cache statistics (size, estimatedMemoryMb, maxLogs, maxMemoryMb)
-   */
+  /** Returns true if the cache is empty. */
+  public boolean isEmpty() {
+    return cache.asMap().isEmpty();
+  }
+
+  /** Gets all cached entries (path -> LogData). Returns a snapshot copy. */
+  public Map<String, LogData> getAllEntries() {
+    return new LinkedHashMap<>(cache.asMap());
+  }
+
+  /** Gets cache statistics. */
   public Map<String, Object> getStats() {
-    cacheLock.readLock().lock();
-    try {
-      long estimatedMemoryBytes = memoryEstimator.estimateTotalMemory(cache.values());
-      long estimatedMemoryMb = estimatedMemoryBytes / (1024 * 1024);
+    var rt = Runtime.getRuntime();
+    long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+    long maxMb = rt.maxMemory() / (1024 * 1024);
 
-      return Map.of(
-          "size",
-          cache.size(),
-          "estimatedMemoryMb",
-          estimatedMemoryMb,
-          "maxLogs",
-          maxLoadedLogs,
-          "maxMemoryMb",
-          maxMemoryMb,
-          "activeLog",
-          activeLogPath != null ? activeLogPath : "none");
-    } finally {
-      cacheLock.readLock().unlock();
+    return Map.of(
+        "cached_logs", cache.asMap().size(),
+        "heap_used_mb", usedMb,
+        "heap_max_mb", maxMb,
+        "heap_pressure_threshold", String.format("%.0f%%", HEAP_PRESSURE_THRESHOLD * 100));
+  }
+
+  // ==================== Internal ====================
+
+  /** Caffeine removal listener — closes lazy logs and invokes the eviction callback. */
+  private void onRemoval(String path, LogData log, RemovalCause cause) {
+    if (path == null || log == null) return;
+
+    closeIfLazy(log);
+
+    if (cause != RemovalCause.REPLACED) {
+      logger.info("Evicted log '{}' ({})", path, cause.name().toLowerCase());
+      var callback = this.evictionCallback;
+      if (callback != null) {
+        try {
+          callback.accept(path);
+        } catch (Exception e) {
+          logger.warn("Eviction callback failed for '{}': {}", path, e.getMessage());
+        }
+      }
+    }
+  }
+
+  /** Returns true if JVM heap usage exceeds the pressure threshold. */
+  private boolean isUnderHeapPressure() {
+    var rt = Runtime.getRuntime();
+    long maxMemory = rt.maxMemory();
+    long usedMemory = rt.totalMemory() - rt.freeMemory();
+    double freeRatio = 1.0 - ((double) usedMemory / maxMemory);
+    return freeRatio < HEAP_PRESSURE_THRESHOLD;
+  }
+
+  /**
+   * Evicts the least recently accessed entry from the cache.
+   * Uses Caffeine's expireAfterAccess policy to find the oldest entry.
+   */
+  private boolean evictLeastRecentlyUsed(String reason) {
+    var policy = cache.policy().expireAfterAccess();
+    if (policy.isEmpty()) return false;
+
+    // Caffeine's ageOf() gives the time since last access — find the oldest
+    var oldest = policy.get().oldest(1);
+    if (oldest.isEmpty()) return false;
+
+    String pathToEvict = oldest.keySet().iterator().next();
+    cache.invalidate(pathToEvict);
+    logger.info("Force-evicted log '{}' due to {}", pathToEvict, reason);
+    return true;
+  }
+
+  /** Closes a LazyParsedLog to release memory-mapped file resources. */
+  private void closeIfLazy(LogData log) {
+    if (log instanceof org.triplehelix.wpilogmcp.log.LazyParsedLog lazyLog) {
+      try {
+        lazyLog.close();
+      } catch (Exception e) {
+        logger.debug("Error closing lazy log: {}", e.getMessage());
+      }
     }
   }
 }

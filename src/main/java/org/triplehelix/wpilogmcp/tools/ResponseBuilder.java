@@ -88,14 +88,14 @@ public class ResponseBuilder {
   public ResponseBuilder addProperty(String key, Object value) {
     if (value == null) {
       response.add(key, null);
-    } else if (value instanceof String) {
-      response.addProperty(key, (String) value);
-    } else if (value instanceof Number) {
-      response.addProperty(key, (Number) value);
-    } else if (value instanceof Boolean) {
-      response.addProperty(key, (Boolean) value);
-    } else if (value instanceof Character) {
-      response.addProperty(key, (Character) value);
+    } else if (value instanceof String s) {
+      response.addProperty(key, s);
+    } else if (value instanceof Number n) {
+      response.addProperty(key, n);
+    } else if (value instanceof Boolean b) {
+      response.addProperty(key, b);
+    } else if (value instanceof Character c) {
+      response.addProperty(key, c);
     } else {
       // For complex objects, serialize via GSON
       response.add(key, GSON.toJsonTree(value));
@@ -149,16 +149,16 @@ public class ResponseBuilder {
     if (metadata == null) {
       metadata = new JsonObject();
     }
-    if (value instanceof String) {
-      metadata.addProperty(key, (String) value);
-    } else if (value instanceof Number) {
-      metadata.addProperty(key, (Number) value);
-    } else if (value instanceof Boolean) {
-      metadata.addProperty(key, (Boolean) value);
-    } else if (value instanceof Character) {
-      metadata.addProperty(key, (Character) value);
-    } else if (value instanceof JsonElement) {
-      metadata.add(key, (JsonElement) value);
+    if (value instanceof String s) {
+      metadata.addProperty(key, s);
+    } else if (value instanceof Number n) {
+      metadata.addProperty(key, n);
+    } else if (value instanceof Boolean b) {
+      metadata.addProperty(key, b);
+    } else if (value instanceof Character c) {
+      metadata.addProperty(key, c);
+    } else if (value instanceof JsonElement je) {
+      metadata.add(key, je);
     } else {
       metadata.add(key, GSON.toJsonTree(value));
     }
@@ -173,6 +173,38 @@ public class ResponseBuilder {
    *
    * @return The complete response as a JsonObject
    */
+  /**
+   * Adds data quality metrics to the response.
+   *
+   * <p>Automatically adds a warning if the quality score is below 0.5.
+   *
+   * @param quality The data quality metrics
+   * @return This builder for chaining
+   * @since 0.5.0
+   */
+  public ResponseBuilder addDataQuality(DataQuality quality) {
+    response.add("data_quality", quality.toJson());
+    if (quality.qualityScore() < 0.5) {
+      addWarning("Low data quality (score: " + String.format("%.2f", quality.qualityScore())
+          + "). Results should be treated as preliminary.");
+    }
+    return this;
+  }
+
+  /**
+   * Adds LLM analysis directives to the response.
+   *
+   * <p>These directives guide LLMs toward calibrated interpretation of results.
+   *
+   * @param directives The analysis directives
+   * @return This builder for chaining
+   * @since 0.5.0
+   */
+  public ResponseBuilder addDirectives(AnalysisDirectives directives) {
+    response.add("server_analysis_directives", directives.toJson());
+    return this;
+  }
+
   public JsonObject build() {
     // Add warnings array if any warnings were added
     if (!warnings.isEmpty()) {

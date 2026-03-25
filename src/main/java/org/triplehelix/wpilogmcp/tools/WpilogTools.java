@@ -1,6 +1,6 @@
 package org.triplehelix.wpilogmcp.tools;
 
-import org.triplehelix.wpilogmcp.mcp.McpServer;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
 
 /**
  * MCP tool implementations for WPILOG analysis.
@@ -12,14 +12,13 @@ import org.triplehelix.wpilogmcp.mcp.McpServer;
  *
  * <ul>
  *   <li>{@code list_available_logs} - Browse logs in the configured directory
- *   <li>{@code load_log} - Load a WPILOG file for analysis
- *   <li>{@code list_entries} - List all entries in the active log
+ *   <li>{@code list_entries} - List all entries in a log
  *   <li>{@code get_entry_info} - Get detailed info about a specific entry
  *   <li>{@code read_entry} - Read values from an entry with pagination
  *   <li>{@code list_loaded_logs} - List all loaded logs and cache status
- *   <li>{@code set_active_log} - Switch between loaded logs
- *   <li>{@code unload_log} - Unload a specific log
- *   <li>{@code unload_all_logs} - Clear the log cache
+ *   <li>{@code list_struct_types} - List supported WPILib struct types
+ *   <li>{@code health_check} - Check server health and version
+ *   <li>{@code get_game_info} - Get FRC game data for a season
  * </ul>
  *
  * <h2>Query Tools ({@link QueryTools})</h2>
@@ -63,6 +62,9 @@ import org.triplehelix.wpilogmcp.mcp.McpServer;
  *   <li>{@code analyze_auto} - Autonomous routine profiling
  *   <li>{@code analyze_cycles} - Game piece cycle time analysis
  *   <li>{@code analyze_replay_drift} - AdvantageKit replay validation
+ *   <li>{@code analyze_loop_timing} - Robot loop timing analysis
+ *   <li>{@code analyze_can_bus} - CAN bus utilization and error analysis
+ *   <li>{@code predict_battery_health} - Battery health prediction and scoring
  * </ul>
  *
  * <h2>Export Tools ({@link ExportTools})</h2>
@@ -76,6 +78,24 @@ import org.triplehelix.wpilogmcp.mcp.McpServer;
  *
  * <ul>
  *   <li>{@code get_tba_status} - Get The Blue Alliance API integration status
+ *   <li>{@code get_tba_match_data} - Query match scores and detailed results from TBA
+ * </ul>
+ *
+ * <h2>RevLog Tools ({@link RevLogTools})</h2>
+ *
+ * <ul>
+ *   <li>{@code list_revlog_signals} - List available REV signals with sync status
+ *   <li>{@code get_revlog_data} - Query REV signal data with FPGA timestamps
+ *   <li>{@code sync_status} - Get synchronization confidence and details
+ *   <li>{@code set_revlog_offset} - Manually set revlog timestamp offset
+ *   <li>{@code wait_for_sync} - Wait for background sync to complete
+ * </ul>
+ *
+ * <h2>Discovery Tools ({@link DiscoveryTools})</h2>
+ *
+ * <ul>
+ *   <li>{@code get_server_guide} - Comprehensive overview of all server capabilities
+ *   <li>{@code suggest_tools} - Recommend tools for a specific analysis task
  * </ul>
  *
  * @see McpServer.Tool
@@ -86,6 +106,8 @@ import org.triplehelix.wpilogmcp.mcp.McpServer;
  * @see FrcDomainTools
  * @see ExportTools
  * @see TbaTools
+ * @see RevLogTools
+ * @see DiscoveryTools
  */
 public final class WpilogTools {
 
@@ -99,13 +121,15 @@ public final class WpilogTools {
    *
    * @param server The MCP server to register tools with
    */
-  public static void registerAll(McpServer server) {
-    CoreTools.registerAll(server);
-    QueryTools.registerAll(server);
-    StatisticsTools.registerAll(server);
-    RobotAnalysisTools.registerAll(server);
-    FrcDomainTools.registerAll(server);
-    ExportTools.registerAll(server);
-    TbaTools.registerAll(server);
+  public static void registerAll(ToolRegistry registry) {
+    CoreTools.registerAll(registry);
+    QueryTools.registerAll(registry);
+    StatisticsTools.registerAll(registry);
+    RobotAnalysisTools.registerAll(registry);
+    FrcDomainTools.registerAll(registry);
+    ExportTools.registerAll(registry);
+    TbaTools.registerAll(registry);
+    RevLogTools.registerAll(registry);
+    DiscoveryTools.registerAll(registry);
   }
 }

@@ -30,3 +30,6 @@ CODE_REVIEW.md
 
 # K8s secrets (contains credentials)
 k8s/secret.yaml
+.mcp.json
+CODE_REVIEW_PROMPT.md
+CODE_REVIEW_REJECTION.md

@@ -7,12 +7,14 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
+import org.triplehelix.wpilogmcp.log.LogData;
 import org.triplehelix.wpilogmcp.log.TimestampedValue;
-import org.triplehelix.wpilogmcp.mcp.McpServer;
+import org.triplehelix.wpilogmcp.mcp.ToolRegistry;
 import org.triplehelix.wpilogmcp.mcp.McpServer.SchemaBuilder;
-import org.triplehelix.wpilogmcp.mcp.McpServer.Tool;
 
 import static org.triplehelix.wpilogmcp.tools.ToolUtils.*;
 
@@ -23,58 +25,259 @@ public final class RobotAnalysisTools {
 
   private RobotAnalysisTools() {}
 
-  public static void registerAll(McpServer server) {
-    server.registerTool(new GetMatchPhasesTool());
-    server.registerTool(new AnalyzeSwerveTool());
-    server.registerTool(new PowerAnalysisTool());
-    server.registerTool(new CanHealthTool());
-    server.registerTool(new CompareMatchesTool());
-    server.registerTool(new GetCodeMetadataTool());
-    server.registerTool(new MoiRegressionTool());
+  public static void registerAll(ToolRegistry registry) {
+    registry.registerTool(new GetMatchPhasesTool());
+    registry.registerTool(new AnalyzeSwerveTool());
+    registry.registerTool(new PowerAnalysisTool());
+    registry.registerTool(new CanHealthTool());
+    registry.registerTool(new CompareMatchesTool());
+    registry.registerTool(new GetCodeMetadataTool());
+    registry.registerTool(new MoiRegressionTool());
   }
 
-  static class GetMatchPhasesTool implements Tool {
+  static class GetMatchPhasesTool extends LogRequiringTool {
     @Override
     public String name() { return "get_match_phases"; }
 
     @Override
     public String description() {
-      return "Auto-detect match phases (autonomous 0-15s, teleop 15-135s, endgame 120-135s) from DriverStation data or log timestamps.";
+      return "ALWAYS use this tool to find match phases—NEVER manually parse timestamps! "
+          + "Detects autonomous/teleop/endgame phases from DriverStation/FMS mode transitions. "
+          + "Handles FMS disabled gaps, practice modes, and edge cases automatically. "
+          + "Returns start/end times for each phase based on actual DS data, not hardcoded durations. "
+          + "Use these timestamps to filter other analyses to specific match phases."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() { return new SchemaBuilder().build(); }
+    protected JsonObject toolSchema() { return new SchemaBuilder().build(); }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
-
-      var matchStart = log.entries().keySet().stream()
-          .filter(name -> name.contains("DriverStation") && name.contains("Enabled"))
-          .map(name -> log.values().get(name))
-          .filter(Objects::nonNull)
-          .flatMap(List::stream)
-          .filter(tv -> tv.value() instanceof Boolean enabled && enabled)
-          .mapToDouble(TimestampedValue::timestamp)
-          .min();
-
-      double start = matchStart.orElse(log.minTimestamp());
-      double end = log.maxTimestamp();
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
       var result = new JsonObject();
       result.addProperty("success", true);
       result.addProperty("log_duration", log.duration());
 
+      // Find DriverStation entries for mode detection
+      String enabledEntry = null;
+      String autoEntry = null;
+
+      for (var entryName : log.entries().keySet()) {
+        var lower = entryName.toLowerCase();
+        if (lower.contains("driverstation") && lower.contains("enabled") && enabledEntry == null) {
+          enabledEntry = entryName;
+        }
+        if (lower.contains("driverstation") && (lower.contains("autonomous") || lower.contains("auto"))
+            && !lower.contains("command") && autoEntry == null) {
+          autoEntry = entryName;
+        }
+      }
+
       var phases = new JsonObject();
-      phases.add("autonomous", createPhase(start, Math.min(start + 15, end), "Auto (0-15s)"));
-      if (log.duration() > 15) {
-        phases.add("teleop", createPhase(start + 15, Math.min(start + 135, end), "Teleop (15-135s)"));
+      var warnings = new ArrayList<String>();
+
+      if (enabledEntry == null && autoEntry == null) {
+        warnings.add("No DriverStation mode entries found in log. "
+            + "Cannot determine match phases. Look for entries containing 'DriverStation' "
+            + "and 'Enabled' or 'Autonomous'.");
+        result.add("warnings", GSON.toJsonTree(warnings));
+        result.addProperty("source", "none");
+        return result;
       }
-      if (log.duration() > 120) {
-        phases.add("endgame", createPhase(start + 120, Math.min(start + 135, end), "Endgame (120-135s)"));
+
+      // Detect enable/disable transitions
+      Double firstEnableTime = null;
+      Double lastDisableTime = null;
+
+      if (enabledEntry != null) {
+        var enabledValues = log.values().get(enabledEntry);
+        if (enabledValues != null) {
+          for (var tv : enabledValues) {
+            if (tv.value() instanceof Boolean enabled) {
+              if (enabled && firstEnableTime == null) {
+                firstEnableTime = tv.timestamp();
+              }
+              if (!enabled && firstEnableTime != null) {
+                lastDisableTime = tv.timestamp();
+              }
+            }
+          }
+        }
       }
+
+      // Detect autonomous/teleop transitions from DS mode entry.
+      // IMPORTANT: The FMS sets the Autonomous flag BEFORE the robot is enabled
+      // (e.g., during the pre-match countdown). The actual auto period only starts
+      // when Autonomous=true AND Enabled=true simultaneously.
+      // Between auto and teleop, FMS imposes a 1-3 second disabled delay.
+      // We detect teleop start as the first Enabled=true AFTER Autonomous goes false,
+      // rather than using the Autonomous→false timestamp directly.
+      Double autoStart = null;
+      Double autoEnd = null;
+      Double teleopStart = null;
+      Double teleopEnd = null;
+
+      // Get enabled values for cross-referencing with autonomous state
+      var enabledValuesForAutoCheck = enabledEntry != null ? log.values().get(enabledEntry) : null;
+
+      if (autoEntry != null) {
+        var autoValues = log.values().get(autoEntry);
+        if (autoValues != null) {
+          Boolean lastAutoState = null;
+          for (var tv : autoValues) {
+            if (tv.value() instanceof Boolean isAuto) {
+              if (isAuto && (lastAutoState == null || !lastAutoState)) {
+                // Autonomous flag went true — but only count as auto start
+                // if the robot is also enabled (not just pre-match FMS setup)
+                if (ToolUtils.isEnabledAt(enabledValuesForAutoCheck, tv.timestamp())) {
+                  autoStart = tv.timestamp();
+                } else if (autoStart == null) {
+                  // Robot is in auto mode but not yet enabled — find the actual
+                  // enable time while still in auto mode
+                  if (enabledValuesForAutoCheck != null) {
+                    for (var ev : enabledValuesForAutoCheck) {
+                      if (ev.timestamp() > tv.timestamp() && ev.value() instanceof Boolean en && en) {
+                        autoStart = ev.timestamp();
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              if (!isAuto && lastAutoState != null && lastAutoState) {
+                autoEnd = tv.timestamp();
+              }
+              lastAutoState = isAuto;
+            }
+          }
+        }
+      }
+
+      // Find teleop start: first Enabled=true after auto ends.
+      // FMS imposes a 1-3s disabled gap between auto and teleop.
+      // If the robot was continuously enabled (no FMS, practice mode),
+      // teleop starts immediately at autoEnd.
+      if (autoEnd != null && enabledEntry != null) {
+        var enabledValues = log.values().get(enabledEntry);
+        if (enabledValues != null) {
+          // Check the robot's enabled state at autoEnd
+          Boolean stateAtAutoEnd = null;
+          Boolean lastState = null;
+          for (var tv : enabledValues) {
+            if (tv.value() instanceof Boolean enabled) {
+              if (tv.timestamp() <= autoEnd) {
+                stateAtAutoEnd = enabled;
+              }
+              // Look for a disable→enable transition after autoEnd
+              // (the FMS disabled gap followed by teleop enable)
+              if (tv.timestamp() >= autoEnd && enabled
+                  && lastState != null && !lastState) {
+                teleopStart = tv.timestamp();
+                break;
+              }
+              lastState = enabled;
+            }
+          }
+
+          // If robot stayed enabled through auto→teleop (no FMS gap),
+          // teleop starts at autoEnd
+          if (teleopStart == null && Boolean.TRUE.equals(stateAtAutoEnd)) {
+            teleopStart = autoEnd;
+          }
+        }
+      }
+
+      // Fallback: if no Enabled entry, use autoEnd as teleop start
+      if (teleopStart == null && autoEnd != null) {
+        teleopStart = autoEnd;
+      }
+
+      // Build phases from observed transitions
+      if (autoStart != null) {
+        Double aEnd = autoEnd;
+        if (aEnd == null) {
+          // Use game knowledge base for auto duration fallback before falling back to
+          // lastDisableTime/maxTimestamp, which would incorrectly label the entire match as auto
+          try {
+            var kb = org.triplehelix.wpilogmcp.game.GameKnowledgeBase.getInstance();
+            int seasonYear = ToolUtils.estimateSeasonYear(log);
+            var gameData = kb.getGame(seasonYear);
+            if (gameData != null) {
+              aEnd = autoStart + gameData.autoDurationSec();
+            }
+          } catch (Exception ignored) {
+            // Fall back below
+          }
+          if (aEnd == null) {
+            aEnd = firstEnableTime != null && lastDisableTime != null ? lastDisableTime : log.maxTimestamp();
+          }
+        }
+        phases.add("autonomous", createPhase(autoStart, aEnd, "Autonomous"));
+      }
+
+      if (teleopStart != null) {
+        double tEnd = lastDisableTime != null ? lastDisableTime : log.maxTimestamp();
+        if (tEnd > teleopStart) {
+          phases.add("teleop", createPhase(teleopStart, tEnd, "Teleop"));
+          teleopEnd = tEnd;
+
+          // Add endgame phase: use game knowledge if available, otherwise default 20s before teleop end
+          double endgameBeforeEnd = 20.0; // default
+          try {
+            var kb = org.triplehelix.wpilogmcp.game.GameKnowledgeBase.getInstance();
+            int seasonYear = ToolUtils.estimateSeasonYear(log);
+            var gameData = kb.getGame(seasonYear);
+            if (gameData != null) {
+              endgameBeforeEnd = gameData.endgameStartBeforeEndSec();
+            }
+          } catch (Exception ignored) {
+            // Fall back to default
+          }
+          double endgameStart = tEnd - endgameBeforeEnd;
+          if (endgameStart > teleopStart && endgameStart < tEnd) {
+            phases.add("endgame", createPhase(endgameStart, tEnd, "Endgame"));
+          }
+        }
+      }
+
+      // If we have autonomous data but no separate teleop marker,
+      // and the robot was enabled before auto, note it
+      if (autoStart == null && firstEnableTime != null) {
+        double end = lastDisableTime != null ? lastDisableTime : log.maxTimestamp();
+        phases.add("enabled", createPhase(firstEnableTime, end, "Enabled (mode unknown)"));
+        warnings.add("Robot enable/disable detected but autonomous/teleop mode transitions "
+            + "not found. Cannot distinguish match phases.");
+      }
+
       result.add("phases", phases);
+      result.addProperty("source", "DriverStation");
+
+      // Add match duration if we can determine it
+      if (firstEnableTime != null && lastDisableTime != null) {
+        result.addProperty("match_duration", lastDisableTime - firstEnableTime);
+      }
+      if (autoStart != null && autoEnd != null) {
+        result.addProperty("auto_duration", autoEnd - autoStart);
+      }
+      if (teleopStart != null && teleopEnd != null) {
+        result.addProperty("teleop_duration", teleopEnd - teleopStart);
+      }
+
+      if (!warnings.isEmpty()) {
+        result.add("warnings", GSON.toJsonTree(warnings));
+      }
+
+      // Attach data quality from the DriverStation enabled entry
+      var qualityValues = enabledEntry != null ? log.values().get(enabledEntry) : null;
+      if (qualityValues != null && !qualityValues.isEmpty()) {
+        var quality = DataQuality.fromValues(qualityValues);
+        result.add("data_quality", quality.toJson());
+        var directives = AnalysisDirectives.fromQuality(quality)
+            .addSingleMatchCaveat();
+        result.add("server_analysis_directives", directives.toJson());
+      }
+
       return result;
     }
 
@@ -88,29 +291,35 @@ public final class RobotAnalysisTools {
     }
   }
 
-  static class AnalyzeSwerveTool implements Tool {
+  static class AnalyzeSwerveTool extends LogRequiringTool {
     @Override
     public String name() { return "analyze_swerve"; }
 
     @Override
     public String description() {
-      return "Analyze swerve drive module performance. Looks for wheel slip, module synchronization issues, and speed discrepancies. "
-          + "Returns 'no swerve modules detected' if log does not contain swerve module state entries.";
+      return "Analyze swerve drive module performance: per-module speed statistics from SwerveModuleState entries. "
+          + "Returns 'no swerve modules detected' if log does not contain swerve module state entries."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MECHANISM;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("module_prefix", "string", "Entry path prefix (e.g., '/Drive/Module')", false)
+          .addNumberProperty("slip_threshold", "Speed difference threshold for slip detection in m/s (default: 0.5)", false, 0.5)
+          .addNumberProperty("sync_threshold_rad", "Angle threshold for sync deviation in radians (default: 0.1)", false, 0.1)
+          .addProperty("odometry_entry", "string", "Explicit odometry pose entry name", false)
+          .addProperty("vision_entry", "string", "Explicit vision pose entry name", false)
           .build();
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
-
-      var prefix = arguments.has("module_prefix") ? arguments.get("module_prefix").getAsString() : null;
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
+      var prefix = getOptString(arguments, "module_prefix", null);
+      double slipThreshold = getOptDouble(arguments, "slip_threshold", 0.5);
+      double syncThresholdRad = getOptDouble(arguments, "sync_threshold_rad", 0.1);
+      var odomEntryName = getOptString(arguments, "odometry_entry", null);
+      var visionEntryName = getOptString(arguments, "vision_entry", null);
 
       var categorizedEntries = log.entries().entrySet().stream()
           .filter(e -> prefix == null || e.getKey().startsWith(prefix))
@@ -129,6 +338,7 @@ public final class RobotAnalysisTools {
       var states = categorizedEntries.get("module_states");
       var warnings = new ArrayList<String>();
 
+      // 1. Per-module speed statistics
       if (states != null) {
         var analysis = new JsonArray();
         for (var name : states) {
@@ -142,6 +352,40 @@ public final class RobotAnalysisTools {
         result.add("module_analysis", analysis);
       }
 
+      // 2. Wheel slip detection — find setpoint/measured pairs
+      if (states != null) {
+        var slipAnalysis = analyzeWheelSlip(log, states, slipThreshold);
+        if (slipAnalysis != null) {
+          result.add("wheel_slip", slipAnalysis);
+        }
+      }
+
+      // 3. Module sync analysis — compare angles across modules
+      if (states != null && states.size() >= 2) {
+        var syncAnalysis = analyzeModuleSync(log, states, syncThresholdRad);
+        if (syncAnalysis != null) {
+          result.add("module_sync", syncAnalysis);
+        }
+      }
+
+      // 4. Odometry drift analysis
+      var driftAnalysis = analyzeOdometryDrift(log, odomEntryName, visionEntryName);
+      if (driftAnalysis != null) {
+        result.add("odometry_drift", driftAnalysis);
+      }
+
+      // Data quality from first module state entry
+      if (states != null && !states.isEmpty()) {
+        var qVals = log.values().get(states.get(0));
+        if (qVals != null) {
+          var quality = DataQuality.fromValues(qVals);
+          var directives = AnalysisDirectives.fromQuality(quality)
+              .addSingleMatchCaveat()
+              .addFollowup("Use power_analysis to check if module issues correlate with brownouts");
+          appendQualityToResult(result, quality, directives);
+        }
+      }
+
       if (!warnings.isEmpty()) {
         result.add("warnings", GSON.toJsonTree(warnings));
       }
@@ -152,23 +396,9 @@ public final class RobotAnalysisTools {
     private JsonObject analyzeModule(String name, List<TimestampedValue> values) {
       if (values == null || values.isEmpty()) return null;
 
-      var speeds = values.stream()
-          .flatMap(tv -> {
-            if (tv.value() instanceof Map) {
-              return java.util.stream.Stream.of((Map<?, ?>) tv.value());
-            } else if (tv.value() instanceof List) {
-              return ((List<?>) tv.value()).stream()
-                  .filter(v -> v instanceof Map)
-                  .map(v -> (Map<?, ?>) v);
-            }
-            return java.util.stream.Stream.empty();
-          })
-          .map(m -> m.get("speed_mps"))
-          .filter(v -> v instanceof Number)
-          .mapToDouble(v -> Math.abs(((Number) v).doubleValue()))
-          .toArray();
-
+      var speeds = extractSpeeds(values);
       if (speeds.length == 0) return null;
+
       var stats = java.util.Arrays.stream(speeds).summaryStatistics();
       var obj = new JsonObject();
       obj.addProperty("entry", name);
@@ -177,33 +407,362 @@ public final class RobotAnalysisTools {
       obj.addProperty("sample_count", stats.getCount());
       return obj;
     }
+
+    /** Detects wheel slip by comparing setpoint and measured module state entries. */
+    private JsonObject analyzeWheelSlip(LogData log, List<String> stateEntries, double threshold) {
+      // Find setpoint/measured pairs by naming convention (deduplicated)
+      var pairs = new ArrayList<String[]>(); // [setpoint, measured]
+      Set<String> seenPairs = new HashSet<>();
+      for (var entry : stateEntries) {
+        var lower = entry.toLowerCase();
+        if (lower.contains("setpoint") || lower.contains("desired") || lower.contains("target")) {
+          // Look for matching measured entry
+          String base = entry.replaceAll("(?i)(setpoint|desired|target)", "");
+          for (var other : stateEntries) {
+            var otherLower = other.toLowerCase();
+            if ((otherLower.contains("measured") || otherLower.contains("actual") || otherLower.contains("state"))
+                && other.replaceAll("(?i)(measured|actual|state)", "").equalsIgnoreCase(base)) {
+              String pairKey = entry + "|" + other;
+              if (seenPairs.add(pairKey)) {
+                pairs.add(new String[]{entry, other});
+              }
+            }
+          }
+          // Also try: same prefix, Setpoint vs Measured suffix
+          for (var other : stateEntries) {
+            if (!other.equals(entry) && sharePrefix(entry, other)) {
+              String pairKey = entry + "|" + other;
+              if (seenPairs.add(pairKey)) {
+                pairs.add(new String[]{entry, other});
+              }
+            }
+          }
+        }
+      }
+
+      if (pairs.isEmpty()) return null;
+
+      var slipResult = new JsonObject();
+      var moduleSlips = new JsonArray();
+
+      for (var pair : pairs) {
+        var setpointVals = log.values().get(pair[0]);
+        var measuredVals = log.values().get(pair[1]);
+        if (setpointVals == null || measuredVals == null) continue;
+
+        // Use measured timestamps as reference, interpolate setpoint speeds
+        // This handles different sample rates correctly
+        if (setpointVals.isEmpty() || measuredVals.isEmpty()) continue;
+
+        double maxSlip = 0;
+        double sumSlip = 0;
+        int slipEvents = 0;
+        int comparedCount = 0;
+
+        for (var mv : measuredVals) {
+          double mSpeed = extractSingleSpeed(mv);
+          if (Double.isNaN(mSpeed)) continue;
+          mSpeed = Math.abs(mSpeed);
+
+          // Interpolate setpoint speed at this measured timestamp
+          Double sSpeedInterp = interpolateSpeedAtTime(setpointVals, mv.timestamp());
+          if (sSpeedInterp == null) continue;
+          double sSpeed = Math.abs(sSpeedInterp);
+
+          if (sSpeed > 0.01) { // minimum speed to avoid division by near-zero
+            double slip = Math.abs(mSpeed - sSpeed) / sSpeed;
+            maxSlip = Math.max(maxSlip, slip);
+            sumSlip += slip;
+            if (Math.abs(mSpeed - sSpeed) > threshold) slipEvents++;
+            comparedCount++;
+          }
+        }
+
+        if (comparedCount == 0) continue;
+
+        var moduleSlip = new JsonObject();
+        moduleSlip.addProperty("setpoint_entry", pair[0]);
+        moduleSlip.addProperty("measured_entry", pair[1]);
+        moduleSlip.addProperty("max_slip_ratio", maxSlip);
+        moduleSlip.addProperty("avg_slip_ratio", sumSlip / comparedCount);
+        moduleSlip.addProperty("slip_events", slipEvents);
+        moduleSlip.addProperty("slip_event_rate", (double) slipEvents / comparedCount);
+        moduleSlip.addProperty("samples_compared", comparedCount);
+        moduleSlips.add(moduleSlip);
+      }
+
+      if (moduleSlips.size() == 0) return null;
+      slipResult.add("modules", moduleSlips);
+      slipResult.addProperty("pair_count", moduleSlips.size());
+      return slipResult;
+    }
+
+    /** Analyzes steering angle synchronization across modules. */
+    private JsonObject analyzeModuleSync(LogData log, List<String> stateEntries, double thresholdRad) {
+      // Collect measured entries (exclude setpoints)
+      var measuredEntries = stateEntries.stream()
+          .filter(e -> {
+            var lower = e.toLowerCase();
+            return !lower.contains("setpoint") && !lower.contains("desired") && !lower.contains("target");
+          })
+          .toList();
+
+      if (measuredEntries.size() < 2) return null;
+
+      // Extract angle arrays for each module
+      var moduleAngles = new ArrayList<double[]>();
+      var moduleNames = new ArrayList<String>();
+      int minLen = Integer.MAX_VALUE;
+
+      for (var entry : measuredEntries) {
+        var values = log.values().get(entry);
+        if (values == null) continue;
+        double[] angles = extractAngles(values);
+        if (angles.length == 0) continue;
+        moduleAngles.add(angles);
+        moduleNames.add(entry);
+        minLen = Math.min(minLen, angles.length);
+      }
+
+      if (moduleAngles.size() < 2 || minLen == 0) return null;
+
+      // At each timestamp, compute max deviation from mean angle
+      int desyncEvents = 0;
+      double maxDeviation = 0;
+      String worstModule = "";
+
+      for (int i = 0; i < minLen; i++) {
+        // Circular mean: average of angles on the unit circle
+        double sinSum = 0, cosSum = 0;
+        for (var angles : moduleAngles) {
+          sinSum += Math.sin(angles[i]);
+          cosSum += Math.cos(angles[i]);
+        }
+        double circularMean = Math.atan2(sinSum / moduleAngles.size(), cosSum / moduleAngles.size());
+
+        for (int m = 0; m < moduleAngles.size(); m++) {
+          // Angular distance (handles wrapping at +/- pi)
+          double dev = Math.abs(Math.atan2(
+              Math.sin(moduleAngles.get(m)[i] - circularMean),
+              Math.cos(moduleAngles.get(m)[i] - circularMean)));
+          if (dev > maxDeviation) {
+            maxDeviation = dev;
+            worstModule = moduleNames.get(m);
+          }
+          if (dev > thresholdRad) desyncEvents++;
+        }
+      }
+
+      var syncResult = new JsonObject();
+      syncResult.addProperty("module_count", moduleAngles.size());
+      syncResult.addProperty("samples_analyzed", minLen);
+      syncResult.addProperty("desync_events", desyncEvents);
+      syncResult.addProperty("max_deviation_rad", maxDeviation);
+      syncResult.addProperty("max_deviation_deg", Math.toDegrees(maxDeviation));
+      if (!worstModule.isEmpty()) {
+        syncResult.addProperty("worst_module", worstModule);
+      }
+      return syncResult;
+    }
+
+    /** Analyzes odometry drift by comparing odometry pose to vision pose. */
+    @SuppressWarnings("unchecked")
+    private JsonObject analyzeOdometryDrift(LogData log, String odomName, String visionName) {
+      // Discover entries if not specified
+      if (odomName == null) {
+        odomName = log.entries().keySet().stream()
+            .filter(n -> {
+              var lower = n.toLowerCase();
+              var type = log.entries().get(n).type();
+              return (lower.contains("odometry") || lower.contains("estimatedpose"))
+                  && (type.contains("Pose2d") || type.contains("Pose3d"));
+            })
+            .findFirst().orElse(null);
+      }
+      if (visionName == null) {
+        visionName = log.entries().keySet().stream()
+            .filter(n -> {
+              var lower = n.toLowerCase();
+              var type = log.entries().get(n).type();
+              return lower.contains("vision") && lower.contains("pose")
+                  && (type.contains("Pose2d") || type.contains("Pose3d"));
+            })
+            .findFirst().orElse(null);
+      }
+
+      if (odomName == null || visionName == null) return null;
+
+      var odomVals = log.values().get(odomName);
+      var visionVals = log.values().get(visionName);
+      if (odomVals == null || visionVals == null || odomVals.size() < 2 || visionVals.size() < 2) {
+        return null;
+      }
+
+      // Compare poses at vision timestamps (lower rate)
+      double totalDrift = 0;
+      int comparisons = 0;
+      double maxDrift = 0;
+
+      for (var vTv : visionVals) {
+        if (!(vTv.value() instanceof Map)) continue;
+        var visionPose = (Map<String, Object>) vTv.value();
+
+        // Find nearest odometry pose (ZOH) using binary search
+        var odomRaw = ToolUtils.getValueAtTimeZoh(odomVals, vTv.timestamp());
+        if (!(odomRaw instanceof Map)) continue;
+        @SuppressWarnings("unchecked")
+        var odomPose = (Map<String, Object>) odomRaw;
+
+        if (odomPose == null) continue;
+
+        double dist = poseDistance(odomPose, visionPose);
+        totalDrift += dist;
+        maxDrift = Math.max(maxDrift, dist);
+        comparisons++;
+      }
+
+      if (comparisons < 2) return null;
+
+      double timeSpan = visionVals.get(visionVals.size() - 1).timestamp() - visionVals.get(0).timestamp();
+      var driftResult = new JsonObject();
+      driftResult.addProperty("odometry_entry", odomName);
+      driftResult.addProperty("vision_entry", visionName);
+      driftResult.addProperty("avg_error_m", totalDrift / comparisons);
+      driftResult.addProperty("max_error_m", maxDrift);
+      driftResult.addProperty("max_error_per_total_time", timeSpan > 0 ? maxDrift / timeSpan : 0);
+      driftResult.addProperty("comparisons", comparisons);
+      return driftResult;
+    }
+
+    // ==================== Helpers ====================
+
+    private double[] extractSpeeds(List<TimestampedValue> values) {
+      return values.stream()
+          .flatMap(tv -> {
+            if (tv.value() instanceof Map<?, ?> m) {
+              return java.util.stream.Stream.of(m);
+            } else if (tv.value() instanceof List<?> l) {
+              return l.stream()
+                  .filter(v -> v instanceof Map).map(v -> (Map<?, ?>) v);
+            }
+            return java.util.stream.Stream.empty();
+          })
+          .map(m -> m.get("speed_mps"))
+          .filter(v -> v instanceof Number)
+          .mapToDouble(v -> ((Number) v).doubleValue())
+          .toArray();
+    }
+
+    /** Extracts speed from a single TimestampedValue (Map with speed_mps). Returns NaN if not available. */
+    private double extractSingleSpeed(TimestampedValue tv) {
+      if (tv.value() instanceof Map<?, ?> m) {
+        var speed = m.get("speed_mps");
+        if (speed instanceof Number n) return n.doubleValue();
+      }
+      return Double.NaN;
+    }
+
+    /** Interpolates speed at a given timestamp using linear interpolation on the speed_mps field. */
+    private Double interpolateSpeedAtTime(List<TimestampedValue> values, double targetTimestamp) {
+      if (values == null || values.size() < 2) return null;
+
+      // Binary search for the insertion point
+      int lo = 0, hi = values.size() - 1;
+      while (lo < hi - 1) {
+        int mid = (lo + hi) >>> 1;
+        if (values.get(mid).timestamp() <= targetTimestamp) lo = mid;
+        else hi = mid;
+      }
+
+      double t0 = values.get(lo).timestamp();
+      double t1 = values.get(hi).timestamp();
+      double s0 = extractSingleSpeed(values.get(lo));
+      double s1 = extractSingleSpeed(values.get(hi));
+
+      if (Double.isNaN(s0) || Double.isNaN(s1)) return null;
+      if (targetTimestamp < values.get(0).timestamp() || targetTimestamp > values.get(values.size() - 1).timestamp()) {
+        return null;
+      }
+
+      double dt = t1 - t0;
+      if (dt < 1e-9) return s0;
+      double frac = (targetTimestamp - t0) / dt;
+      return s0 + frac * (s1 - s0);
+    }
+
+    private double[] extractAngles(List<TimestampedValue> values) {
+      return values.stream()
+          .flatMap(tv -> {
+            if (tv.value() instanceof Map<?, ?> m) {
+              return java.util.stream.Stream.of(m);
+            } else if (tv.value() instanceof List<?> l) {
+              return l.stream()
+                  .filter(v -> v instanceof Map).map(v -> (Map<?, ?>) v);
+            }
+            return java.util.stream.Stream.empty();
+          })
+          .map(m -> {
+            var angle = m.get("angle_rad");
+            if (angle instanceof Number n) return n.doubleValue();
+            // Try nested Rotation2d (may use "value" or "radians" field)
+            if (m.get("angle") instanceof Map<?, ?> angleMap) {
+              var rot = angleMap.get("value");
+              if (rot == null) rot = angleMap.get("radians");
+              if (rot instanceof Number n) return n.doubleValue();
+            }
+            return null;
+          })
+          .filter(Objects::nonNull)
+          .mapToDouble(v -> (double) v)
+          .toArray();
+    }
+
+    /** Distance between two Pose2d/3d maps. */
+    @SuppressWarnings("unchecked")
+    private double poseDistance(Map<String, Object> p1, Map<String, Object> p2) {
+      var t1 = (Map<String, Object>) p1.get("translation");
+      var t2 = (Map<String, Object>) p2.get("translation");
+      if (t1 == null || t2 == null) return 0;
+      double dx = ((Number) t1.getOrDefault("x", 0.0)).doubleValue()
+                 - ((Number) t2.getOrDefault("x", 0.0)).doubleValue();
+      double dy = ((Number) t1.getOrDefault("y", 0.0)).doubleValue()
+                 - ((Number) t2.getOrDefault("y", 0.0)).doubleValue();
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    /** Checks if two entry names share a common prefix (before Setpoint/Measured suffix). */
+    private boolean sharePrefix(String a, String b) {
+      int lastSlashA = a.lastIndexOf('/');
+      int lastSlashB = b.lastIndexOf('/');
+      if (lastSlashA < 0 || lastSlashB < 0) return false;
+      return a.substring(0, lastSlashA).equals(b.substring(0, lastSlashB));
+    }
   }
 
-  static class PowerAnalysisTool implements Tool {
+  static class PowerAnalysisTool extends LogRequiringTool {
     @Override
     public String name() { return "power_analysis"; }
 
     @Override
     public String description() {
       return "Analyze battery and current distribution data. Finds peak currents per channel and brownout risk. "
-          + "Returns 'no battery data found' if log does not contain battery voltage or current entries.";
+          + "Default threshold is 6.8V (roboRIO 1). Set to 6.3V for roboRIO 2. "
+          + "Returns 'no battery data found' if log does not contain battery voltage or current entries."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_POWER;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("power_prefix", "string", "Entry path prefix (e.g., '/PDP')", false)
-          .addNumberProperty("brownout_threshold", "Voltage threshold (default 7.0V)", false, 7.0)
+          .addNumberProperty("brownout_threshold", "Voltage threshold (default 6.8V for roboRIO 1, use 6.3V for roboRIO 2)", false, 6.8)
           .build();
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
-
-      var prefix = arguments.has("power_prefix") ? arguments.get("power_prefix").getAsString() : null;
-      double threshold = arguments.has("brownout_threshold") ? arguments.get("brownout_threshold").getAsDouble() : 7.0;
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
+      var prefix = getOptString(arguments, "power_prefix", null);
+      double threshold = getOptDouble(arguments, "brownout_threshold", 6.8);
 
       var voltageEntry = log.entries().keySet().stream()
           .filter(n -> (prefix == null || n.startsWith(prefix)) && (n.toLowerCase().contains("voltage")))
@@ -235,48 +794,128 @@ public final class RobotAnalysisTools {
         }
       });
 
+      // Add data quality from voltage entry if available
+      if (voltageEntry.isPresent()) {
+        var vals = log.values().get(voltageEntry.get());
+        if (vals != null && !vals.isEmpty()) {
+          var quality = DataQuality.fromValues(vals);
+          var directives = AnalysisDirectives.fromQuality(quality)
+              .addSingleMatchCaveat()
+              .addFollowup("Use predict_battery_health for comprehensive battery assessment");
+          appendQualityToResult(result, quality, directives);
+        }
+      }
+
       return result;
     }
   }
 
-  static class CanHealthTool implements Tool {
+  static class CanHealthTool extends LogRequiringTool {
     @Override
     public String name() { return "can_health"; }
 
     @Override
     public String description() {
       return "Analyze CAN bus health by looking for timeout errors and communication issues. "
-          + "Returns 'no CAN data found' if log does not contain CAN bus utilization or error entries.";
+          + "Returns 'no CAN data found' if log does not contain CAN bus utilization or error entries."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MATCH_ANALYSIS;
     }
 
     @Override
-    public JsonObject inputSchema() { return new SchemaBuilder().build(); }
+    protected JsonObject toolSchema() { return new SchemaBuilder().build(); }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
 
-      var errorCounts = log.entries().entrySet().stream()
-          .filter(e -> "string".equals(e.getValue().type()))
-          .collect(Collectors.toMap(Map.Entry::getKey, e -> {
-            var values = log.values().get(e.getKey());
-            return values == null ? 0L : values.stream()
-                .filter(tv -> tv.value() instanceof String s && isCanError(s))
-                .count();
-          }))
-          .entrySet().stream()
-          .filter(e -> e.getValue() > 0)
-          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      // Find the DriverStation Enabled entry for cross-referencing
+      String enabledEntryName = findDsEntry(log, "enabled");
+      List<TimestampedValue> enabledValues = enabledEntryName != null
+          ? log.values().get(enabledEntryName) : null;
+      boolean hasEnabledData = enabledValues != null && !enabledValues.isEmpty();
+
+      long totalEnabled = 0;
+      long totalDisabled = 0;
+      long totalAll = 0;
+
+      var errorCounts = new JsonObject();
+      var allCanErrorValues = new ArrayList<TimestampedValue>();
+
+      for (var entry : log.entries().entrySet()) {
+        if (!"string".equals(entry.getValue().type())) continue;
+        var values = log.values().get(entry.getKey());
+        if (values == null) continue;
+
+        long enabledErrors = 0;
+        long disabledErrors = 0;
+
+        for (var tv : values) {
+          if (!(tv.value() instanceof String s) || !isCanError(s)) continue;
+          allCanErrorValues.add(tv);
+
+          if (hasEnabledData) {
+            if (isEnabledAt(enabledValues, tv.timestamp())) {
+              enabledErrors++;
+            } else {
+              disabledErrors++;
+            }
+          } else {
+            enabledErrors++; // count all as "enabled" when no DS data
+          }
+        }
+
+        long entryTotal = enabledErrors + disabledErrors;
+        if (entryTotal > 0) {
+          var entryObj = new JsonObject();
+          entryObj.addProperty("total", entryTotal);
+          if (hasEnabledData) {
+            entryObj.addProperty("while_enabled", enabledErrors);
+            entryObj.addProperty("while_disabled", disabledErrors);
+          }
+          errorCounts.add(entry.getKey(), entryObj);
+          totalEnabled += enabledErrors;
+          totalDisabled += disabledErrors;
+          totalAll += entryTotal;
+        }
+      }
 
       var result = new JsonObject();
       result.addProperty("success", true);
-      result.add("error_counts_by_entry", GSON.toJsonTree(errorCounts));
-      
-      long total = errorCounts.values().stream().mapToLong(Long::longValue).sum();
-      result.addProperty("total_can_errors", total);
-      result.addProperty("health_assessment", total == 0 ? "GOOD" : (total < 50 ? "CONCERNING" : "POOR"));
-      
+      result.add("error_counts_by_entry", errorCounts);
+
+      result.addProperty("total_can_errors", totalAll);
+      if (hasEnabledData) {
+        result.addProperty("errors_while_enabled", totalEnabled);
+        result.addProperty("errors_while_disabled", totalDisabled);
+        // Base health assessment only on enabled-state errors
+        result.addProperty("health_assessment",
+            totalEnabled == 0 ? "GOOD" : (totalEnabled < 50 ? "CONCERNING" : "POOR"));
+      } else {
+        result.addProperty("health_assessment",
+            totalAll == 0 ? "GOOD" : (totalAll < 50 ? "CONCERNING" : "POOR"));
+      }
+
+      var warnings = new ArrayList<String>();
+      if (!hasEnabledData) {
+        warnings.add("No DriverStation Enabled entry found. Cannot distinguish enabled vs disabled CAN errors. "
+            + "All errors are counted toward the health assessment.");
+      }
+      if (totalDisabled > 0) {
+        warnings.add("CAN errors while disabled (" + totalDisabled + ") are normal "
+            + "and excluded from health assessment.");
+      }
+      if (!warnings.isEmpty()) {
+        result.add("warnings", GSON.toJsonTree(warnings));
+      }
+
+      // Data quality
+      if (!allCanErrorValues.isEmpty()) {
+        var quality = DataQuality.fromValues(allCanErrorValues);
+        var directives = AnalysisDirectives.fromQuality(quality)
+            .addSingleMatchCaveat()
+            .addGuidance("CAN errors while disabled are normal; focus on enabled-state errors");
+        appendQualityToResult(result, quality, directives);
+      }
+
       return result;
     }
 
@@ -286,56 +925,80 @@ public final class RobotAnalysisTools {
     }
   }
 
-  static class CompareMatchesTool implements Tool {
+  static class CompareMatchesTool extends ToolBase {
     @Override
     public String name() { return "compare_matches"; }
 
     @Override
-    public String description() { return "Compare statistics for an entry across multiple loaded log files."; }
-
-    @Override
-    public JsonObject inputSchema() {
-      return new SchemaBuilder().addProperty("name", "string", "Entry name", true).build();
+    public String description() {
+      return "Compare statistics for an entry across two log files."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_STATISTICAL;
     }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var loadedPaths = getLogManager().getLoadedLogPaths();
-      if (loadedPaths.size() < 2) return errorResult("Need at least 2 logs loaded to compare. Currently loaded: " + loadedPaths.size());
+    public JsonObject inputSchema() {
+      return new SchemaBuilder()
+          .addProperty("path", "string", "Path to the first log file", true)
+          .addProperty("compare_path", "string", "Path to the second log file", true)
+          .addProperty("name", "string", "Entry name to compare", true)
+          .build();
+    }
 
-      var name = arguments.get("name").getAsString();
-      var originalActive = getLogManager().getActiveLogPath();
+    @Override
+    protected JsonElement executeInternal(JsonObject arguments) throws Exception {
+      var path1 = getRequiredString(arguments, "path");
+      var path2 = getRequiredString(arguments, "compare_path");
+      var name = getRequiredString(arguments, "name");
 
-      var comparisons = loadedPaths.stream()
-          .map(path -> {
-            getLogManager().setActiveLog(path);
-            var log = getLogManager().getActiveLog();
-            var stats = new JsonObject();
-            stats.addProperty("log_filename", Path.of(path).getFileName().toString());
-            
-            var vals = log.values().get(name);
-            if (vals != null) {
-              var s = vals.stream()
-                  .filter(tv -> tv.value() instanceof Number)
-                  .mapToDouble(tv -> ((Number) tv.value()).doubleValue())
-                  .summaryStatistics();
-              if (s.getCount() > 0) {
-                var sObj = new JsonObject();
-                sObj.addProperty("min", s.getMin());
-                sObj.addProperty("max", s.getMax());
-                sObj.addProperty("mean", s.getAverage());
-                stats.add("statistics", sObj);
-              }
-            }
-            return stats;
-          })
-          .collect(JsonArray::new, JsonArray::add, JsonArray::addAll);
+      if (path1.equals(path2)) {
+        throw new IllegalArgumentException("path and compare_path must be different log files");
+      }
 
-      if (originalActive != null) getLogManager().setActiveLog(originalActive);
+      var log1 = logManager.getOrLoad(path1);
+      var log2 = logManager.getOrLoad(path2);
+
+      // Use a LinkedHashMap to ensure deterministic output order (path1 first, path2 second)
+      var logsByPath = new java.util.LinkedHashMap<String, LogData>();
+      logsByPath.put(path1, log1);
+      logsByPath.put(path2, log2);
+
+      var comparisons = new JsonArray();
+      for (var entry : logsByPath.entrySet()) {
+        var logPath = entry.getKey();
+        var log = entry.getValue();
+        var stats = new JsonObject();
+        stats.addProperty("log_filename", Path.of(logPath).getFileName().toString());
+
+        var vals = log.values().get(name);
+        if (vals != null) {
+          var s = vals.stream()
+              .filter(tv -> tv.value() instanceof Number)
+              .mapToDouble(tv -> ((Number) tv.value()).doubleValue())
+              .summaryStatistics();
+          if (s.getCount() > 0) {
+            var sObj = new JsonObject();
+            sObj.addProperty("min", s.getMin());
+            sObj.addProperty("max", s.getMax());
+            sObj.addProperty("mean", s.getAverage());
+            stats.add("statistics", sObj);
+          }
+        }
+        comparisons.add(stats);
+      }
 
       var result = new JsonObject();
       result.addProperty("success", true);
       result.add("comparisons", comparisons);
+
+      // Data quality from first log's values for this entry
+      var vals1 = log1.values().get(name);
+      if (vals1 != null && !vals1.isEmpty()) {
+        var quality = DataQuality.fromValues(vals1);
+        var directives = AnalysisDirectives.fromQuality(quality)
+            .addGuidance("Cross-match comparisons require consistent logging configurations for valid comparison");
+        appendQualityToResult(result, quality, directives);
+      }
+
       return result;
     }
   }
@@ -357,7 +1020,7 @@ public final class RobotAnalysisTools {
    * applies optional moving-average smoothing, computes the numerical velocity derivative, then
    * solves the 2×2 normal equations analytically.
    */
-  static class MoiRegressionTool implements Tool {
+  static class MoiRegressionTool extends LogRequiringTool {
 
     @Override
     public String name() { return "moi_regression"; }
@@ -369,11 +1032,12 @@ public final class RobotAnalysisTools {
           + "Model: G * motor_count * kt * I = J * α + B * ω. "
           + "Supports angular (rad/s) or linear (m/s, via wheel_radius) velocity entries. "
           + "Provide applied_volts_entry when current is always non-negative (TalonFX/SparkMax) "
-          + "so torque direction is recovered from voltage sign.";
+          + "so torque direction is recovered from voltage sign."
+          + GUIDANCE_UNIVERSAL + GUIDANCE_MECHANISM;
     }
 
     @Override
-    public JsonObject inputSchema() {
+    protected JsonObject toolSchema() {
       return new SchemaBuilder()
           .addProperty("velocity_entry", "string",
               "Entry path for mechanism velocity (rad/s, or m/s if wheel_radius is given)", true)
@@ -403,10 +1067,7 @@ public final class RobotAnalysisTools {
     }
 
     @Override
-    public JsonElement execute(JsonObject args) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
-
+    protected JsonElement executeWithLog(LogData log, JsonObject args) throws Exception {
       // ── Required params ──────────────────────────────────────────────────────
       var velEntry  = getRequiredString(args, "velocity_entry");
       var currEntry = getRequiredString(args, "current_entry");
@@ -466,10 +1127,14 @@ public final class RobotAnalysisTools {
       double[] alpha  = gradient(omegaS, ts);
 
       // ── Interpolate current to velocity timestamps ────────────────────────────
+      // Null means the current signal has no data at this timestamp (e.g., the
+      // current log starts later than the velocity log). We mark these with NaN
+      // and skip them in the OLS loop rather than inserting 0.0, which would
+      // silently corrupt the regression fit.
       double[] curr = new double[n];
       for (int i = 0; i < n; i++) {
         Double v = getValueAtTimeLinear(currValues, ts[i]);
-        curr[i] = v != null ? v : 0.0;
+        curr[i] = v != null ? v : Double.NaN;
       }
 
       // ── Torque direction sign ─────────────────────────────────────────────────
@@ -478,7 +1143,7 @@ public final class RobotAnalysisTools {
       if (voltsValues != null) {
         for (int i = 0; i < n; i++) {
           Double v = getValueAtTimeLinear(voltsValues, ts[i]);
-          tauSign[i] = v != null ? Math.signum(v) : 0.0; // 0.0 → filtered out below
+          tauSign[i] = v != null ? Math.signum(v) : Double.NaN;
         }
       } else {
         java.util.Arrays.fill(tauSign, 1.0);
@@ -489,7 +1154,8 @@ public final class RobotAnalysisTools {
       int nUsed = 0, filtByThr = 0, filtBySign = 0;
 
       for (int i = 0; i < n; i++) {
-        if (!Double.isFinite(alpha[i]) || !Double.isFinite(omegaS[i]) || !Double.isFinite(curr[i]))
+        if (!Double.isFinite(alpha[i]) || !Double.isFinite(omegaS[i])
+            || !Double.isFinite(curr[i]) || !Double.isFinite(tauSign[i]))
           continue;
         if (Math.abs(alpha[i]) < alphaThr) { filtByThr++;  continue; }
         if (voltsValues != null && Math.abs(tauSign[i]) < 0.5) { filtBySign++; continue; }
@@ -513,41 +1179,36 @@ public final class RobotAnalysisTools {
       }
 
       double det = sumA2 * sumW2 - sumAW * sumAW;
-      if (Math.abs(det) < 1e-20)
+      double detScale = Math.max(sumA2 * sumW2, 1e-20);
+      if (Math.abs(det) < Math.max(1e-10 * detScale, 1e-15))
         return errorResult("Singular OLS matrix: α and ω are nearly collinear. "
             + "Try a different time window or increase alpha_threshold.");
 
       double J = (sumTA * sumW2 - sumTW * sumAW) / det;
       double B = (sumTW * sumA2 - sumTA * sumAW) / det;
 
-      // ── R² ───────────────────────────────────────────────────────────────────
-      // Collect filtered y values, then do a second pass for ssTot/ssRes.
-      double[] ys = new double[nUsed];
-      int yi = 0;
+      // ── R² (uncentered) ──────────────────────────────────────────────────────
+      // The physics model τ = Jα + Bω has no intercept term, so we use the
+      // uncentered R² = 1 - SS_res / SS_y² where SS_y² = Σyᵢ².
+      // Standard centered R² (using mean of Y) is mathematically invalid for
+      // regression through the origin and can produce misleading or negative values.
+      double ssY2 = 0, ssRes = 0;
+      int residualCount = 0;
       for (int i = 0; i < n; i++) {
-        if (!Double.isFinite(alpha[i]) || !Double.isFinite(omegaS[i]) || !Double.isFinite(curr[i]))
+        if (!Double.isFinite(alpha[i]) || !Double.isFinite(omegaS[i])
+            || !Double.isFinite(curr[i]) || !Double.isFinite(tauSign[i]))
           continue;
         if (Math.abs(alpha[i]) < alphaThr) continue;
         if (voltsValues != null && Math.abs(tauSign[i]) < 0.5) continue;
-        ys[yi++] = torqueScale * tauSign[i] * Math.abs(curr[i]);
-      }
-      double mean = 0;
-      for (double y : ys) mean += y;
-      mean /= ys.length;
-
-      double ssTot = 0, ssRes = 0;
-      int ri = 0;
-      for (int i = 0; i < n; i++) {
-        if (!Double.isFinite(alpha[i]) || !Double.isFinite(omegaS[i]) || !Double.isFinite(curr[i]))
-          continue;
-        if (Math.abs(alpha[i]) < alphaThr) continue;
-        if (voltsValues != null && Math.abs(tauSign[i]) < 0.5) continue;
-        double y    = ys[ri++];
+        double y    = torqueScale * tauSign[i] * Math.abs(curr[i]);
         double yHat = J * alpha[i] + B * omegaS[i];
-        ssTot += (y - mean) * (y - mean);
-        ssRes += (y - yHat) * (y - yHat);
+        ssY2  += y * y;
+        double residual = y - yHat;
+        ssRes += residual * residual;
+        residualCount++;
       }
-      double r2 = ssTot > 1e-20 ? 1.0 - ssRes / ssTot : Double.NaN;
+      double r2 = ssY2 > 1e-20 ? 1.0 - ssRes / ssY2 : Double.NaN;
+      double rmse = residualCount > 0 ? Math.sqrt(ssRes / residualCount) : Double.NaN;
 
       // ── Build result ──────────────────────────────────────────────────────────
       var result = new JsonObject();
@@ -555,6 +1216,7 @@ public final class RobotAnalysisTools {
       result.addProperty("J_kg_m2", J);
       result.addProperty("B_Nm_s_per_rad", B);
       result.addProperty("r_squared", r2);
+      result.addProperty("rmse_nm", rmse);
       result.addProperty("n_samples_used", nUsed);
       result.addProperty("n_samples_total", n);
       result.addProperty("filtered_by_alpha_threshold", filtByThr);
@@ -578,6 +1240,13 @@ public final class RobotAnalysisTools {
       if (endTime    != null)  ctx.addProperty("end_time",   endTime);
       result.add("parameters_used", ctx);
 
+      // Data quality from velocity entry
+      var quality = DataQuality.fromValues(velFiltered);
+      var directives = AnalysisDirectives.fromQuality(quality)
+          .addSingleMatchCaveat()
+          .addGuidance("Regression estimates depend on data quality and model assumptions");
+      appendQualityToResult(result, quality, directives);
+
       return result;
     }
 
@@ -595,20 +1264,28 @@ public final class RobotAnalysisTools {
       return out;
     }
 
-    /** Numerical gradient using central differences (numpy.gradient semantics). */
+    /**
+     * Numerical gradient using central differences (numpy.gradient semantics).
+     * Guards against zero dt (duplicate timestamps) by returning NaN for those samples,
+     * which are then filtered out by the isFinite check in the OLS loop.
+     */
     private double[] gradient(double[] v, double[] t) {
       int n = v.length;
       double[] g = new double[n];
       if (n < 2) return g;
-      g[0]     = (v[1]   - v[0])     / (t[1]   - t[0]);
-      g[n - 1] = (v[n-1] - v[n-2])   / (t[n-1] - t[n-2]);
-      for (int i = 1; i < n - 1; i++)
-        g[i] = (v[i+1] - v[i-1]) / (t[i+1] - t[i-1]);
+      double dt0 = t[1] - t[0];
+      g[0] = dt0 > 1e-9 ? (v[1] - v[0]) / dt0 : Double.NaN;
+      double dtN = t[n - 1] - t[n - 2];
+      g[n - 1] = dtN > 1e-9 ? (v[n - 1] - v[n - 2]) / dtN : Double.NaN;
+      for (int i = 1; i < n - 1; i++) {
+        double dt = t[i + 1] - t[i - 1];
+        g[i] = dt > 1e-9 ? (v[i + 1] - v[i - 1]) / dt : Double.NaN;
+      }
       return g;
     }
   }
 
-  static class GetCodeMetadataTool implements Tool {
+  static class GetCodeMetadataTool extends LogRequiringTool {
     @Override
     public String name() { return "get_code_metadata"; }
 
@@ -619,25 +1296,24 @@ public final class RobotAnalysisTools {
     }
 
     @Override
-    public JsonObject inputSchema() { return new SchemaBuilder().build(); }
+    protected JsonObject toolSchema() { return new SchemaBuilder().build(); }
 
     @Override
-    public JsonElement execute(JsonObject arguments) throws Exception {
-      var log = getLogManager().getActiveLog();
-      if (log == null) return errorResult("No log loaded");
-
+    protected JsonElement executeWithLog(LogData log, JsonObject arguments) throws Exception {
       var keys = List.of("GitSHA", "GitBranch", "GitDirty", "BuildDate", "ProjectName", "Version");
       var found = log.entries().keySet().stream()
           .filter(name -> keys.stream().anyMatch(name::contains))
           .collect(Collectors.toMap(
               name -> keys.stream().filter(name::contains).findFirst().get(),
-              name -> log.values().get(name).get(0).value(),
+              name -> {
+                var vals = log.values().get(name);
+                return (vals != null && !vals.isEmpty()) ? vals.get(0).value() : "unknown";
+              },
               (v1, v2) -> v1));
 
-      var result = new JsonObject();
-      result.addProperty("success", true);
-      result.add("metadata", GSON.toJsonTree(found));
-      return result;
+      return success()
+          .addData("metadata", GSON.toJsonTree(found))
+          .build();
     }
   }
 }
