@@ -4,7 +4,7 @@
 
 wpilog-mcp lets you ask those questions in plain English. Load your robot's telemetry logs and have a conversation with your data.  Built by [FRC Team 2363 Triple Helix](https://team2363.org) using WPILib's official `DataLogReader` for guaranteed format compatibility.
 
-**See what's possible:** [Example Analysis Report](EXAMPLE.md) - A complete match analysis generated from real robot logs.
+**See what's possible:** Check out the [example analyses](doc/) generated from real robot logs — in particular, the [VACHE Power Analysis](doc/VACHE_POWER_ANALYSIS.md) is a stellar demonstration of the system's strict insistence against over-interpretation, conducted using the most recent version.
 
 ## Table of Contents
 
@@ -13,6 +13,7 @@ wpilog-mcp lets you ask those questions in plain English. Load your robot's tele
 - [Configuration](#configuration)
 - [Available Tools](#available-tools)
 - [Supported Data Types](#supported-data-types)
+- [Containerization](#containerization)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -267,7 +268,7 @@ The system reports confidence levels (HIGH/MEDIUM/LOW/FAILED) based on correlati
 - Bus voltage, output current, temperature
 - Faults and sticky faults
 
-See [TOOLS.md](TOOLS.md#revlog-tools) for detailed tool documentation and a technical explanation of the synchronization algorithm.
+See [TOOLS.md](doc/TOOLS.md#revlog-tools) for detailed tool documentation and a technical explanation of the synchronization algorithm.
 
 ### Claude Desktop
 
@@ -355,6 +356,59 @@ wpilog-mcp provides 45 tools organized into categories. All log-requiring tools 
 | `SwerveSample` | `timestamp`, `x`, `y`, `heading`, `heading_deg`, `vx`, `vy`, `omega`, `ax`, `ay`, `alpha`, `moduleForcesX[4]`, `moduleForcesY[4]` |
 
 *Note: `PoseObservation.type` is decoded as an enum string: `MEGATAG_1`, `MEGATAG_2`, or `PHOTONVISION`.*
+
+## Containerization
+
+You can run wpilog-mcp in a Docker container for team-shared or cloud-hosted deployments. The following `Dockerfile` uses a multi-stage build to keep the runtime image small.
+
+*Thanks to [Godmar Back](https://github.com/godmar) for contributing this setup.*
+
+**`Dockerfile`:**
+```dockerfile
+FROM eclipse-temurin:17-jdk AS build
+WORKDIR /app
+
+# Copy Gradle wrapper and config first for dependency caching
+COPY gradlew settings.gradle build.gradle gradle.properties ./
+COPY gradle/ gradle/
+RUN chmod +x gradlew && ./gradlew --no-daemon dependencies
+
+# Copy source and build fat JAR
+COPY src/ src/
+RUN ./gradlew --no-daemon shadowJar -x test && \
+    cp build/libs/wpilog-mcp-*-all.jar build/libs/wpilog-mcp.jar
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+
+COPY --from=build /app/build/libs/wpilog-mcp.jar ./wpilog-mcp.jar
+
+RUN mkdir -p /logs
+
+ENV WPILOG_DIR=/logs
+ENV TBA_API_KEY=""
+ENV WPILOG_TEAM=""
+ENV WPILOG_HTTP=true
+ENV WPILOG_HTTP_PORT=8000
+ENV WPILOG_HTTP_BIND=0.0.0.0
+ENV WPILOG_HTTP_PATH=/wpilogmcp
+
+EXPOSE 8000
+
+ENTRYPOINT ["java", "-Xmx4g", "-jar", "/app/wpilog-mcp.jar", "--http", "--port", "8000"]
+```
+
+**Build and run:**
+```bash
+docker build -t wpilog-mcp .
+docker run -p 8000:8000 \
+  -v /path/to/your/logs:/logs \
+  -e TBA_API_KEY=your_key_here \
+  -e WPILOG_TEAM=2363 \
+  wpilog-mcp
+```
+
+The server will be available at `http://localhost:8000/wpilogmcp`. Mount your log directory to `/logs` and pass configuration via environment variables.
 
 ## Troubleshooting
 
@@ -451,7 +505,8 @@ MIT License - see [LICENSE](LICENSE)
 
 ## See Also
 
-- [TOOLS.md](TOOLS.md) - Complete tool reference
-- [EXAMPLE.md](EXAMPLE.md) - Sample analysis report showing tool capabilities
+- [TOOLS.md](doc/TOOLS.md) - Complete tool reference
+- [VAALE Event Analysis](doc/VAALE_EVENT_ANALYSIS.md) - Comprehensive event analysis from real robot logs
+- [VACHE Power Analysis](doc/VACHE_POWER_ANALYSIS.md) - In-depth power & voltage analysis showcasing epistemic guardrails
 - [WPILib DataLog Docs](https://docs.wpilib.org/en/stable/docs/software/telemetry/datalog.html)
 - [MCP Protocol](https://modelcontextprotocol.io/)
