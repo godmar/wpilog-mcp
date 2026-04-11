@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Team 401 — Log Stats</title>
+  <link rel="stylesheet" href="__BASE__/ui/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+</head>
+<body data-base-path="__BASE__">
+  <header>
+    <div class="wrap">
+      <h1><a href="__BASE__/">Team 401 Log Stats</a></h1>
+      <nav id="breadcrumbs"></nav>
+    </div>
+  </header>
+
+  <main id="app" class="wrap">
+    <p class="loading">Loading…</p>
+  </main>
+
+  <footer class="wrap">
+    <p>wpilog-stats — shares the wpilog-mcp log cache. Data is read-only from <code id="logs-root"></code>.</p>
+  </footer>
+
+  <script src="__BASE__/ui/app.js"></script>
+</body>
+</html>

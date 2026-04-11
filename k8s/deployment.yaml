@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wpilog
+  namespace: team401mcp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wpilog
+  template:
+    metadata:
+      labels:
+        app: wpilog
+    spec:
+      imagePullSecrets:
+        - name: registry-credentials
+      containers:
+        - name: dufs
+          image: sigoden/dufs
+          args:
+            - "-c"
+            - "/config/dufs-config.yaml"
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: logs
+              mountPath: /logs
+            - name: dufs-config
+              mountPath: /config
+              readOnly: true
+
+        - name: wpilog-mcp
+          image: container.cs.vt.edu/gback/registry/wpilog-mcp
+          ports:
+            - containerPort: 8000
+          env:
+            - name: TBA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wpilog-secrets
+                  key: TBA_API_KEY
+            - name: WPILOG_TEAM
+              value: "401"
+            - name: WPILOG_DIR
+              value: "/logs"
+            - name: WPILOG_HTTP_PATH
+              value: "/wpilogmcp"
+            - name: WPILOG_HTTP_ALLOWED_ORIGINS
+              value: "team401.endeavour.cs.vt.edu"
+          volumeMounts:
+            - name: logs
+              mountPath: /logs
+
+        - name: wpilog-stats
+          image: container.cs.vt.edu/gback/registry/wpilog-stats
+          ports:
+            - containerPort: 8001
+              name: stats-http
+          env:
+            - name: WPILOG_TEAM
+              value: "401"
+            - name: WPILOG_DIR
+              value: "/logs"
+            - name: STATS_PORT
+              value: "8001"
+            - name: STATS_BIND
+              value: "0.0.0.0"
+            - name: STATS_BASE_PATH
+              value: "/stats"
+          volumeMounts:
+            - name: logs
+              mountPath: /logs
+              readOnly: true
+
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: wpilog-logs
+        - name: dufs-config
+          secret:
+            secretName: wpilog-secrets
+            items:
+              - key: dufs-config.yaml
+                path: dufs-config.yaml

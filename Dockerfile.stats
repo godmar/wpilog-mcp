@@ -1,0 +1,32 @@
+FROM eclipse-temurin:17-jdk AS build
+WORKDIR /app
+
+# Copy Gradle wrapper and config first for dependency caching
+COPY gradlew settings.gradle build.gradle gradle.properties ./
+COPY gradle/ gradle/
+RUN chmod +x gradlew && ./gradlew --no-daemon dependencies
+
+# Copy source and build fat JAR (same JAR as wpilog-mcp — the stats app lives
+# in the same codebase and is selected at runtime via a different main class).
+COPY src/ src/
+RUN ./gradlew --no-daemon shadowJar -x test && \
+    cp build/libs/wpilog-mcp-*-all.jar build/libs/wpilog-mcp.jar
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+
+COPY --from=build /app/build/libs/wpilog-mcp.jar ./wpilog-mcp.jar
+
+RUN mkdir -p /logs
+
+ENV WPILOG_DIR=/logs
+ENV STATS_PORT=8000
+ENV STATS_BIND=0.0.0.0
+ENV STATS_BASE_PATH=/stats
+
+EXPOSE 8000
+
+# Run StatsMain directly via classpath so we bypass the jar's Main-Class
+# attribute (which points at wpilog-mcp's Main).
+ENTRYPOINT ["java", "-Xmx2g", "-cp", "/app/wpilog-mcp.jar", \
+            "org.team401.wpilogstats.StatsMain"]

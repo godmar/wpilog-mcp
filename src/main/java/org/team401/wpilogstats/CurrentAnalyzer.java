@@ -1,0 +1,505 @@
+package org.team401.wpilogstats;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.triplehelix.wpilogmcp.log.LogData;
+import org.triplehelix.wpilogmcp.log.TimestampedValue;
+
+/**
+ * Computes current-draw analyses for a parsed wpilog.
+ *
+ * <p>Two flavors of current entry are handled:
+ *
+ * <ul>
+ *   <li><b>Direct:</b> entries whose name ends in {@code supplyCurrentAmps} (case-insensitive)
+ *       are taken at face value — these are the supply currents logged by most non-swerve
+ *       subsystems (elevator, arm, intake, etc.).
+ *   <li><b>Computed swerve:</b> swerve modules do not log supply current directly.
+ *       Instead we look for sets of entries that share a common prefix and include
+ *       {@code driveAppliedVolts}, {@code driveCurrentAmps}, {@code turnAppliedVolts},
+ *       {@code turnCurrentAmps}. For each such module we compute
+ *       <pre>
+ *       supplyCurrentAmps =
+ *           (|driveAppliedVolts| * driveCurrentAmps
+ *            + |turnAppliedVolts * turnCurrentAmps|) / batteryVoltage
+ *       </pre>
+ *       sampled at the timestamps of the drive stator current.
+ * </ul>
+ *
+ * <p>All time series are downsampled (via {@link BatteryAnalyzer#downsample}) before
+ * being returned so browser payloads stay reasonable regardless of log length.
+ */
+public class CurrentAnalyzer {
+
+  private static final int TIME_SERIES_MAX_POINTS = 1500;
+
+  // Entry suffixes used for swerve module detection.
+  private static final String DRIVE_VOLT_SUFFIX = "driveappliedvolts";
+  private static final String DRIVE_AMP_SUFFIX = "drivecurrentamps";
+  private static final String TURN_VOLT_SUFFIX = "turnappliedvolts";
+  private static final String TURN_AMP_SUFFIX = "turncurrentamps";
+  private static final String SUPPLY_SUFFIX = "supplycurrentamps";
+
+  // ======================================================================
+  // Public entry points
+  // ======================================================================
+
+  public CurrentSummary summarize(LogData log) {
+    return analyze(log, false).summary();
+  }
+
+  public CurrentDetail detail(LogData log) {
+    return analyze(log, true);
+  }
+
+  // ======================================================================
+  // Core
+  // ======================================================================
+
+  private CurrentDetail analyze(LogData log, boolean includeSeries) {
+    List<Subsystem> subsystems = new ArrayList<>();
+
+    var battery = findBatteryEntry(log);
+
+    // --- Swerve modules (computed) ---
+    var modules = detectSwerveModules(log);
+    for (var module : modules) {
+      var samples = computeSwerveSupplyCurrent(log, module, battery);
+      if (samples.isEmpty()) continue;
+      var stats = stats(samples);
+      JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
+      subsystems.add(new Subsystem(
+          "Swerve " + module.label(),
+          module.prefix() + "/(computed)",
+          "swerve",
+          stats, series));
+    }
+
+    // --- Direct supplyCurrentAmps entries ---
+    for (var name : log.entries().keySet()) {
+      String lower = name.toLowerCase();
+      if (!lower.endsWith(SUPPLY_SUFFIX)) continue;
+      // Skip anything that looks like it belongs to a swerve module we already handled.
+      if (belongsToKnownModule(name, modules)) continue;
+      var values = log.values().get(name);
+      if (values == null || values.isEmpty()) continue;
+      var samples = new ArrayList<Sample>(values.size());
+      for (var tv : values) {
+        Double v = toDouble(tv.value());
+        if (v == null || !Double.isFinite(v)) continue;
+        samples.add(new Sample(tv.timestamp(), v));
+      }
+      if (samples.isEmpty()) continue;
+      var stats = stats(samples);
+      JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
+      subsystems.add(new Subsystem(
+          friendlyName(name),
+          name,
+          "direct",
+          stats, series));
+    }
+
+    subsystems.sort(Comparator.comparingDouble((Subsystem s) -> s.stats.mean()).reversed());
+
+    double meanTotal = 0.0;
+    double peakTotal = 0.0;
+    for (var s : subsystems) {
+      meanTotal += s.stats.mean();
+      peakTotal += s.stats.peak();
+    }
+
+    var summary = new CurrentSummary(subsystems.size(), meanTotal, peakTotal,
+        Collections.unmodifiableList(subsystems));
+    return new CurrentDetail(summary);
+  }
+
+  // ======================================================================
+  // Swerve module detection & computation
+  // ======================================================================
+
+  private record ModuleGroup(String prefix, String label,
+                             String driveVoltEntry, String driveAmpEntry,
+                             String turnVoltEntry, String turnAmpEntry) {}
+
+  private List<ModuleGroup> detectSwerveModules(LogData log) {
+    // Map prefix -> available suffix entries.
+    var byPrefix = new LinkedHashMap<String, Map<String, String>>();
+    for (var entryName : log.entries().keySet()) {
+      String lower = entryName.toLowerCase();
+      String suffix;
+      if (lower.endsWith(DRIVE_VOLT_SUFFIX)) suffix = DRIVE_VOLT_SUFFIX;
+      else if (lower.endsWith(DRIVE_AMP_SUFFIX)) suffix = DRIVE_AMP_SUFFIX;
+      else if (lower.endsWith(TURN_VOLT_SUFFIX)) suffix = TURN_VOLT_SUFFIX;
+      else if (lower.endsWith(TURN_AMP_SUFFIX)) suffix = TURN_AMP_SUFFIX;
+      else continue;
+
+      String prefix = entryName.substring(0, entryName.length() - suffix.length());
+      // Trim a trailing separator so two different suffix casings land in the same prefix.
+      if (prefix.endsWith("/") || prefix.endsWith(".") || prefix.endsWith("_")) {
+        prefix = prefix.substring(0, prefix.length() - 1);
+      }
+      byPrefix.computeIfAbsent(prefix, k -> new LinkedHashMap<>()).put(suffix, entryName);
+    }
+
+    var modules = new ArrayList<ModuleGroup>();
+    for (var e : byPrefix.entrySet()) {
+      var map = e.getValue();
+      if (map.size() < 4) continue;
+      String dv = map.get(DRIVE_VOLT_SUFFIX);
+      String da = map.get(DRIVE_AMP_SUFFIX);
+      String tv = map.get(TURN_VOLT_SUFFIX);
+      String ta = map.get(TURN_AMP_SUFFIX);
+      if (dv == null || da == null || tv == null || ta == null) continue;
+      modules.add(new ModuleGroup(e.getKey(), labelFor(e.getKey()), dv, da, tv, ta));
+    }
+    return modules;
+  }
+
+  private static String labelFor(String prefix) {
+    String p = prefix.toLowerCase();
+    if (p.contains("frontleft") || p.endsWith("/0") || p.contains("module0")) return "Front Left";
+    if (p.contains("frontright") || p.endsWith("/1") || p.contains("module1")) return "Front Right";
+    if (p.contains("backleft") || p.endsWith("/2") || p.contains("module2")) return "Back Left";
+    if (p.contains("backright") || p.endsWith("/3") || p.contains("module3")) return "Back Right";
+    int slash = prefix.lastIndexOf('/');
+    return slash >= 0 ? prefix.substring(slash + 1) : prefix;
+  }
+
+  private boolean belongsToKnownModule(String entry, List<ModuleGroup> modules) {
+    for (var m : modules) {
+      if (entry.equalsIgnoreCase(m.driveVoltEntry)
+          || entry.equalsIgnoreCase(m.driveAmpEntry)
+          || entry.equalsIgnoreCase(m.turnVoltEntry)
+          || entry.equalsIgnoreCase(m.turnAmpEntry)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private List<Sample> computeSwerveSupplyCurrent(
+      LogData log, ModuleGroup module, String batteryEntry) {
+    var driveVolts = log.values().get(module.driveVoltEntry);
+    var driveAmps = log.values().get(module.driveAmpEntry);
+    var turnVolts = log.values().get(module.turnVoltEntry);
+    var turnAmps = log.values().get(module.turnAmpEntry);
+    var battery = batteryEntry != null ? log.values().get(batteryEntry) : null;
+
+    if (driveVolts == null || driveAmps == null || turnVolts == null || turnAmps == null) {
+      return List.of();
+    }
+
+    // Use drive current timestamps as the master clock — that's the field the formula
+    // multiplies directly, so we naturally align the "hot" variable.
+    var result = new ArrayList<Sample>(driveAmps.size());
+    var dvCursor = new Cursor();
+    var tvCursor = new Cursor();
+    var taCursor = new Cursor();
+    var batCursor = new Cursor();
+
+    for (var tv : driveAmps) {
+      double t = tv.timestamp();
+      Double driveAmpV = toDouble(tv.value());
+      if (driveAmpV == null || !Double.isFinite(driveAmpV)) continue;
+
+      Double driveVoltV = holdAt(driveVolts, t, dvCursor);
+      Double turnVoltV = holdAt(turnVolts, t, tvCursor);
+      Double turnAmpV = holdAt(turnAmps, t, taCursor);
+      Double batteryV = battery != null ? holdAt(battery, t, batCursor) : null;
+      if (driveVoltV == null || turnVoltV == null || turnAmpV == null) continue;
+      if (batteryV == null || batteryV <= 0.5) continue; // unplausible — skip
+
+      double supply = (Math.abs(driveVoltV) * driveAmpV
+          + Math.abs(turnVoltV * turnAmpV)) / batteryV;
+      if (!Double.isFinite(supply)) continue;
+      // Reject obvious glitches (negative is unusual; tolerate small dips to zero).
+      if (supply < -5 || supply > 500) continue;
+      result.add(new Sample(t, supply));
+    }
+    return result;
+  }
+
+  /** A stateful cursor into a sorted-by-time {@code TimestampedValue} list. */
+  private static final class Cursor {
+    int index = 0;
+  }
+
+  /** Returns the most recent numeric value at-or-before {@code t}, or null if unavailable. */
+  private static Double holdAt(List<TimestampedValue> values, double t, Cursor cursor) {
+    if (values == null || values.isEmpty()) return null;
+    int i = cursor.index;
+    // Advance while the next sample is still in the past.
+    while (i + 1 < values.size() && values.get(i + 1).timestamp() <= t) {
+      i++;
+    }
+    cursor.index = i;
+    var tv = values.get(i);
+    if (tv.timestamp() > t) return null; // before the first sample
+    return toDouble(tv.value());
+  }
+
+  // ======================================================================
+  // Stats + downsampling
+  // ======================================================================
+
+  private record Sample(double t, double v) {}
+
+  private static Stats stats(List<Sample> samples) {
+    if (samples.isEmpty()) return Stats.empty();
+    double sum = 0.0;
+    double min = Double.POSITIVE_INFINITY;
+    double max = Double.NEGATIVE_INFINITY;
+    double sumSq = 0.0;
+    for (var s : samples) {
+      sum += s.v;
+      sumSq += s.v * s.v;
+      if (s.v < min) min = s.v;
+      if (s.v > max) max = s.v;
+    }
+    int n = samples.size();
+    double mean = sum / n;
+    double variance = n > 1 ? (sumSq - n * mean * mean) / (n - 1) : 0.0;
+    double rms = Math.sqrt(sumSq / n);
+    double stdDev = Math.sqrt(Math.max(0, variance));
+    return new Stats(n, min, max, mean, rms, stdDev);
+  }
+
+  private record Stats(int count, double min, double peak, double mean,
+                       double rms, double stdDev) {
+    static Stats empty() { return new Stats(0, 0, 0, 0, 0, 0); }
+
+    JsonObject toJson() {
+      var o = new JsonObject();
+      o.addProperty("sampleCount", count);
+      if (count == 0) return o;
+      o.addProperty("min", min);
+      o.addProperty("peak", peak);
+      o.addProperty("mean", mean);
+      o.addProperty("rms", rms);
+      o.addProperty("stdDev", stdDev);
+      return o;
+    }
+  }
+
+  private static JsonArray downsampleSamples(List<Sample> samples, int maxPoints) {
+    var out = new JsonArray();
+    int n = samples.size();
+    if (n == 0) return out;
+    if (n <= maxPoints) {
+      for (var s : samples) {
+        var pt = new JsonArray();
+        pt.add(s.t);
+        pt.add(s.v);
+        out.add(pt);
+      }
+      return out;
+    }
+    int buckets = Math.max(1, maxPoints / 2);
+    double bucketSize = (double) n / buckets;
+    for (int b = 0; b < buckets; b++) {
+      int start = (int) Math.floor(b * bucketSize);
+      int end = (int) Math.floor((b + 1) * bucketSize);
+      if (end <= start) end = start + 1;
+      if (end > n) end = n;
+      double minV = Double.POSITIVE_INFINITY;
+      double maxV = Double.NEGATIVE_INFINITY;
+      double tMin = 0, tMax = 0;
+      for (int i = start; i < end; i++) {
+        var s = samples.get(i);
+        if (s.v < minV) { minV = s.v; tMin = s.t; }
+        if (s.v > maxV) { maxV = s.v; tMax = s.t; }
+      }
+      if (tMin <= tMax) {
+        out.add(point(tMin, minV));
+        if (tMin != tMax || minV != maxV) out.add(point(tMax, maxV));
+      } else {
+        out.add(point(tMax, maxV));
+        out.add(point(tMin, minV));
+      }
+    }
+    return out;
+  }
+
+  private static JsonArray point(double t, double v) {
+    var pt = new JsonArray();
+    pt.add(t);
+    pt.add(v);
+    return pt;
+  }
+
+  // ======================================================================
+  // Helpers (duplicated with BatteryAnalyzer to keep packages independent)
+  // ======================================================================
+
+  private String findBatteryEntry(LogData log) {
+    var names = log.entries().keySet();
+    for (String pattern : List.of(
+        "robotcontroller/batteryvoltage", "batteryvoltage",
+        "battery_voltage", "input_voltage", "inputvoltage",
+        "pdh/voltage", "pdp/voltage", "/voltage")) {
+      for (String name : names) {
+        if (name.toLowerCase().contains(pattern)) return name;
+      }
+    }
+    return null;
+  }
+
+  private static Double toDouble(Object value) {
+    if (value instanceof Number n) return n.doubleValue();
+    if (value instanceof Boolean b) return b ? 1.0 : 0.0;
+    return null;
+  }
+
+  // Wrapper segments commonly introduced by AdvantageKit and similar IO framing layers.
+  // These carry no subsystem meaning and should be stripped from display labels.
+  private static final java.util.Set<String> WRAPPER_SEGMENTS = java.util.Set.of(
+      "inputs", "io", "outputs", "autologged", "realoutputs", "autolog",
+      "raw", "values", "state");
+
+  // Camel-case suffixes to strip from otherwise meaningful segments
+  // (e.g. "LeadMotorInputs" -> "LeadMotor").
+  private static final String[] WRAPPER_CAMEL_SUFFIXES =
+      {"Inputs", "Outputs", "AutoLogged", "IOInputs"};
+
+  /**
+   * Turns a raw log entry path into a human-readable subsystem label.
+   *
+   * <p>AdvantageKit logs look like {@code /Hood/inputs/SupplyCurrentAmps} or
+   * {@code /Shooter/LeadMotorInputs/SupplyCurrentAmps}. The goal is to drop the
+   * bookkeeping wrappers and surface the actual subsystem name(s).
+   */
+  private static String friendlyName(String entry) {
+    var segs = new ArrayList<String>();
+    for (String s : entry.split("/")) {
+      if (!s.isEmpty()) segs.add(s);
+    }
+    if (segs.isEmpty()) return entry;
+
+    // Handle the last segment: peel off the "supplyCurrentAmps" tail.
+    String last = segs.remove(segs.size() - 1);
+    String lastLower = last.toLowerCase();
+    if (!lastLower.equals(SUPPLY_SUFFIX)) {
+      if (lastLower.endsWith(SUPPLY_SUFFIX)) {
+        String head = last.substring(0, last.length() - SUPPLY_SUFFIX.length());
+        // trim any leftover separator characters
+        while (!head.isEmpty()) {
+          char c = head.charAt(head.length() - 1);
+          if (c == '_' || c == '.' || c == '-') head = head.substring(0, head.length() - 1);
+          else break;
+        }
+        if (!head.isEmpty()) segs.add(head);
+      } else {
+        segs.add(last);
+      }
+    }
+
+    // Drop wrapper segments; strip camel-case wrapper suffixes from the rest.
+    var kept = new ArrayList<String>();
+    for (String seg : segs) {
+      if (WRAPPER_SEGMENTS.contains(seg.toLowerCase())) continue;
+      String trimmed = seg;
+      for (String suffix : WRAPPER_CAMEL_SUFFIXES) {
+        if (trimmed.length() > suffix.length() && trimmed.endsWith(suffix)) {
+          trimmed = trimmed.substring(0, trimmed.length() - suffix.length());
+          break;
+        }
+      }
+      if (!trimmed.isEmpty()) kept.add(trimmed);
+    }
+
+    // Dedupe consecutive duplicates caused by stripping ("Climber/ClimberInputs" → "Climber").
+    var deduped = new ArrayList<String>();
+    for (String s : kept) {
+      if (deduped.isEmpty() || !deduped.get(deduped.size() - 1).equalsIgnoreCase(s)) {
+        deduped.add(s);
+      }
+    }
+
+    if (deduped.isEmpty()) return entry;
+
+    // Join the last up to two surviving segments for a compact label.
+    int start = Math.max(0, deduped.size() - 2);
+    return String.join(" ", deduped.subList(start, deduped.size()));
+  }
+
+  // ======================================================================
+  // Data carriers (package-private so EventService can build JSON from them)
+  // ======================================================================
+
+  static final class Subsystem {
+    final String name;
+    final String entry;
+    final String source; // "direct" or "swerve"
+    final Stats stats;
+    final JsonArray series; // nullable
+
+    Subsystem(String name, String entry, String source, Stats stats, JsonArray series) {
+      this.name = name;
+      this.entry = entry;
+      this.source = source;
+      this.stats = stats;
+      this.series = series;
+    }
+
+    JsonObject toJson() {
+      var o = new JsonObject();
+      o.addProperty("name", name);
+      o.addProperty("entry", entry);
+      o.addProperty("source", source);
+      o.add("stats", stats.toJson());
+      if (series != null) o.add("series", series);
+      return o;
+    }
+  }
+
+  public static final class CurrentSummary {
+    private final int subsystemCount;
+    private final double meanTotalCurrent;
+    private final double peakTotalCurrent;
+    private final List<Subsystem> subsystems;
+
+    CurrentSummary(int subsystemCount, double meanTotalCurrent, double peakTotalCurrent,
+                   List<Subsystem> subsystems) {
+      this.subsystemCount = subsystemCount;
+      this.meanTotalCurrent = meanTotalCurrent;
+      this.peakTotalCurrent = peakTotalCurrent;
+      this.subsystems = subsystems;
+    }
+
+    public boolean hasData() { return subsystemCount > 0; }
+    public double meanTotalCurrent() { return meanTotalCurrent; }
+    public double peakTotalCurrent() { return peakTotalCurrent; }
+
+    public JsonObject toJson() {
+      var o = new JsonObject();
+      o.addProperty("available", subsystemCount > 0);
+      o.addProperty("subsystemCount", subsystemCount);
+      o.addProperty("meanTotalCurrent", meanTotalCurrent);
+      o.addProperty("peakTotalCurrent", peakTotalCurrent);
+      var arr = new JsonArray();
+      for (var s : subsystems) arr.add(s.toJson());
+      o.add("subsystems", arr);
+      return o;
+    }
+  }
+
+  public static final class CurrentDetail {
+    private final CurrentSummary summary;
+
+    CurrentDetail(CurrentSummary summary) {
+      this.summary = summary;
+    }
+
+    public CurrentSummary summary() { return summary; }
+
+    public JsonObject toJson() {
+      return summary.toJson();
+    }
+  }
+}
