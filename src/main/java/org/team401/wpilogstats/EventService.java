@@ -119,9 +119,10 @@ public class EventService {
     for (var path : logFiles) {
       try {
         LogData log = LogManager.getInstance().loadLog(path.toString());
+        var phases = MatchPhaseDetector.detect(log);
 
         var batteryStats = batteryAnalyzer.summarize(log);
-        var currentSummary = currentAnalyzer.summarize(log);
+        var currentSummary = currentAnalyzer.summarize(log, phases);
 
         var entry = new JsonObject();
         entry.addProperty("file", relativeName(path));
@@ -185,9 +186,10 @@ public class EventService {
     result.addProperty("maxTimestamp", log.maxTimestamp());
     result.addProperty("entryCount", log.entryCount());
 
+    var phases = MatchPhaseDetector.detect(log);
     result.add("battery", batteryAnalyzer.detail(log).toJson());
-    result.add("current", currentAnalyzer.detail(log).toJson());
-    result.add("phases", phasesJson(MatchPhaseDetector.detect(log)));
+    result.add("current", currentAnalyzer.detail(log, phases).toJson());
+    result.add("phases", phasesJson(phases));
     return result;
   }
 

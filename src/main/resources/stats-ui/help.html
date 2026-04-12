@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Team 401 — Log Stats — Help</title>
+  <link rel="stylesheet" href="__BASE__/ui/style.css">
+  <style>
+    /* Page-local tweaks: tighter prose column, subtle styling for callouts
+       and code. Kept inline so the help page is fully self-contained. */
+    main.help { max-width: 820px; }
+    main.help p { line-height: 1.55; }
+    main.help li { line-height: 1.55; margin-bottom: 0.35rem; }
+    main.help h3 { margin-top: 2rem; }
+    main.help h4 {
+      color: #e2e8f0;
+      margin-top: 1.5rem;
+      margin-bottom: 0.4rem;
+      font-size: 1.0rem;
+    }
+    main.help code {
+      background: #0b1220;
+      border: 1px solid #1e293b;
+      padding: 0.08rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.88em;
+      color: #cbd5e1;
+    }
+    main.help pre {
+      background: #0b1220;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 0.9rem 1rem;
+      overflow-x: auto;
+      font-size: 0.85rem;
+      line-height: 1.4;
+      color: #cbd5e1;
+    }
+    main.help pre code { background: none; border: none; padding: 0; }
+    main.help .callout {
+      background: #1e293b;
+      border-left: 3px solid #60a5fa;
+      padding: 0.8rem 1rem;
+      border-radius: 4px;
+      margin: 1rem 0;
+    }
+    main.help .callout.warn { border-left-color: #f97316; }
+    main.help .toc {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 0.9rem 1.2rem;
+      margin-bottom: 2rem;
+    }
+    main.help .toc ul { margin: 0.3rem 0 0 1rem; padding: 0; }
+    main.help .toc li { margin-bottom: 0.2rem; }
+    main.help .toc a { color: #60a5fa; text-decoration: none; }
+    main.help .toc a:hover { text-decoration: underline; }
+    main.help h2 small {
+      display: block;
+      color: #94a3b8;
+      font-size: 0.85rem;
+      font-weight: 400;
+      margin-top: 0.35rem;
+    }
+  </style>
+</head>
+<body data-base-path="__BASE__">
+  <header>
+    <div class="wrap header-row">
+      <h1><a href="__BASE__/">Team 401 Log Stats</a></h1>
+      <a class="help-link" href="__BASE__/ui/">&larr; Back to events</a>
+    </div>
+    <div class="wrap">
+      <nav id="breadcrumbs">
+        <a href="__BASE__/">Events</a> &rsaquo; Help &amp; methodology
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap help">
+    <h2>How the stats are computed
+      <small>A short reference for the numbers shown on the summary and per-log pages.</small>
+    </h2>
+
+    <div class="toc">
+      <strong>On this page</strong>
+      <ul>
+        <li><a href="#match-window">Match-window filtering</a></li>
+        <li><a href="#total-current">Total current: mean, peak, P90</a></li>
+        <li><a href="#why-alignment">Why we can't just sum per-subsystem peaks</a></li>
+        <li><a href="#algorithm">The alignment algorithm</a></li>
+        <li><a href="#stats-definitions">Stat definitions</a></li>
+        <li><a href="#caveats">Caveats &amp; known limitations</a></li>
+      </ul>
+    </div>
+
+    <h3 id="match-window">Match-window filtering</h3>
+    <p>
+      All current and battery statistics are computed over the
+      <em>match window</em> only — from the moment the robot first becomes
+      enabled by the Driver Station to the final disable after teleop. Pre-match
+      idle (the several minutes many logs spend sitting on the field before a
+      match) is excluded so it doesn't dilute the numbers.
+    </p>
+    <p>
+      The match window is derived from the DriverStation <code>Enabled</code>
+      and <code>Autonomous</code> booleans in the log, with the usual FMS
+      quirks handled:
+    </p>
+    <ul>
+      <li>
+        The FMS sets <code>Autonomous=true</code> slightly before
+        <code>Enabled=true</code> during the pre-match countdown. We count the
+        auto phase as starting only when <em>both</em> are true.
+      </li>
+      <li>
+        Between auto and teleop there is a ~2 s disabled gap on an FMS. Teleop
+        start is detected as the first re-enable after auto ends (or at auto
+        end itself in practice mode, where the robot stays enabled through
+        the boundary).
+      </li>
+      <li>
+        Match end is the first <code>Enabled=false</code> strictly after
+        teleop start. If the log was cut off with the robot still enabled,
+        match end falls back to the last timestamp in the log.
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>Time-series charts:</strong> the chart x-axes are clipped to
+      this window with about five seconds of padding on each side, so you can
+      see the moment the robot came alive and the moment it went back to
+      disabled without the huge pre-match flat line in the way. The underlying
+      time series itself is not trimmed — hover values outside the visible
+      range are still real data.
+    </div>
+
+    <h3 id="total-current">Total current: mean, peak, P90</h3>
+    <p>
+      The summary page reports three rolled-up figures for "what the battery
+      saw":
+    </p>
+    <ul>
+      <li>
+        <strong>Mean total current</strong> — the average total draw across
+        the match window.
+      </li>
+      <li>
+        <strong>Peak total current</strong> — the single largest instantaneous
+        total draw observed at any moment during the match window. This is
+        the number that should be compared against battery peak-current
+        limits.
+      </li>
+      <li>
+        <strong>P90 total current</strong> — the 90th percentile of the
+        instantaneous total. A "realistic sustained worst-case" figure — far
+        more conservative than peak and far less susceptible to being moved
+        by a single outlier spike.
+      </li>
+    </ul>
+    <p>
+      All three are computed over a <em>single aligned total-current time
+      series</em> built from the individual subsystems, not by aggregating
+      per-subsystem statistics.
+    </p>
+
+    <h3 id="why-alignment">Why we can't just sum per-subsystem peaks</h3>
+    <p>
+      Each subsystem on the robot is logged independently. Direct
+      <code>supplyCurrentAmps</code> entries (AdvantageKit-style) are only
+      written when the value changes, so their samples are sparse and
+      irregular. Swerve modules do not log supply current directly — we
+      derive it per module from <code>driveAppliedVolts</code>,
+      <code>driveCurrentAmps</code>, <code>turnAppliedVolts</code>,
+      <code>turnCurrentAmps</code>, and the battery voltage, sampled at the
+      drive-current timestamps. Those timestamps differ from one module to
+      another.
+    </p>
+    <p>
+      A previous version of this app reported
+      <code>peakTotal = sum(per-subsystem peak)</code>. That number is almost
+      always physically impossible, because each subsystem's peak occurs at
+      a <em>different moment</em>. A swerve module might spike during an
+      acceleration, the shooter during a fire, the climber during an end-of-
+      match hang — and summing those unrelated extremes gives a number much
+      larger than the robot ever actually drew at any single instant. On one
+      real match log this produced ~1034 A of "peak total current" —
+      comfortably above what an FRC battery can physically supply.
+    </p>
+    <div class="callout warn">
+      The fix: build a real total-current time series by aligning every
+      subsystem onto a common time grid, and compute the statistics over
+      <em>that</em> series. The peak then answers the right question — "what
+      was the largest total draw at any single instant during the match?" —
+      and lands in the physically plausible 200–400 A range for a typical
+      FRC match.
+    </div>
+
+    <h3 id="algorithm">The alignment algorithm</h3>
+    <p>
+      The inputs are one sample stream per subsystem, each already filtered
+      to the match window. The output is one aligned sample per distinct
+      timestamp across all streams.
+    </p>
+
+    <h4>Step 1 — union grid with zero-order hold</h4>
+    <p>
+      The output grid is the <strong>union of all input timestamps</strong>.
+      Every moment at which <em>any</em> subsystem produced a sample becomes
+      one output sample. Between updates, each subsystem is held at its most
+      recently observed value (zero-order hold). This is both exact (no
+      interpolation artifacts) and efficient — we don't create redundant
+      samples for subsystems whose values aren't changing.
+    </p>
+    <p>
+      A subsystem that has not yet produced any sample at a given time
+      contributes 0. This is the honest choice: we have no evidence it was
+      drawing current before its first reported value. The practical effect
+      is usually zero, because match-window filtering already aligns
+      everything to roughly the same start point.
+    </p>
+
+    <h4>Step 2 — k-way merge</h4>
+    <p>
+      The merge is a straightforward k-way scan:
+    </p>
+    <pre><code>cursor[i] = 0            // next unread sample index in stream i
+held[i]   = 0.0          // current zero-order-hold value for stream i
+
+while any stream still has samples:
+    nextT = min(stream[i][cursor[i]].t across active streams)
+
+    # Advance every stream whose next sample is at this timestamp.
+    for each stream i:
+        while cursor[i] &lt; len(stream[i]) and
+              stream[i][cursor[i]].t == nextT:
+            held[i] = stream[i][cursor[i]].v
+            cursor[i] += 1
+
+    total = sum(held)
+    output.append((nextT, total))</code></pre>
+    <p>
+      Complexity is <code>O(N&middot;k)</code> where <code>N</code> is the
+      total number of input samples and <code>k</code> is the subsystem
+      count. With typical <code>k</code> ≈ 10–20 and <code>N</code> ≈ 50k per
+      log this runs in well under a millisecond per match.
+    </p>
+
+    <h4>Step 3 — statistics over the aligned series</h4>
+    <p>
+      The aligned series is then handed to the same statistics helper the
+      analyzer uses for individual subsystems, producing mean, peak, RMS,
+      standard deviation, and P90. Those become the
+      <code>meanTotalCurrent</code>, <code>peakTotalCurrent</code>, and
+      <code>p90TotalCurrent</code> fields on the summary.
+    </p>
+
+    <h3 id="stats-definitions">Stat definitions</h3>
+    <p>
+      The per-subsystem "Mean", "Peak", "P90", "StdDev", and "RMS" columns in
+      the subsystem tables use the standard textbook definitions, computed
+      over each subsystem's match-window samples:
+    </p>
+    <ul>
+      <li><strong>Mean</strong> — arithmetic mean of the sample values.</li>
+      <li><strong>Peak</strong> — maximum sample value.</li>
+      <li>
+        <strong>P90</strong> — 90th percentile with linear interpolation
+        between ranks (numpy's default method): rank <code>r = 0.9&middot;(n-1)</code>,
+        then interpolate between <code>values[floor(r)]</code> and
+        <code>values[ceil(r)]</code>.
+      </li>
+      <li>
+        <strong>StdDev</strong> — sample standard deviation with Bessel's
+        correction (<code>n-1</code> denominator).
+      </li>
+      <li><strong>RMS</strong> — root mean square of the sample values.</li>
+    </ul>
+
+    <h3 id="caveats">Caveats &amp; known limitations</h3>
+    <ul>
+      <li>
+        <strong>Sample-weighted, not time-weighted.</strong> The mean and
+        percentiles treat each aligned sample equally, regardless of how much
+        real time it represents. A subsystem logged at 40 Hz contributes many
+        more "votes" to the mean than one that changes five times per match.
+        This is consistent with how the per-subsystem stats work, and in
+        practice the answer is within a few percent of a strictly
+        time-integrated mean for well-behaved logs.
+      </li>
+      <li>
+        <strong>AdvantageKit delta logging.</strong> Direct subsystems using
+        AdvantageKit's <code>supplyCurrentAmps</code> outputs are logged
+        on-change, so their samples naturally cluster inside the match
+        window. Filtering these to the match window removes only a handful
+        of points. Swerve <code>driveCurrentAmps</code>, by contrast, is
+        logged continuously at ~40 Hz from boot — so match-window filtering
+        removes the bulk of pre-match idle samples and dramatically changes
+        swerve's mean/P90. That's expected, not a bug.
+      </li>
+      <li>
+        <strong>Swerve supply current is derived.</strong> Swerve modules
+        don't log supply current directly. We compute it per module as
+        <code>supply = (|driveAppliedVolts| &middot; driveCurrentAmps +
+        |turnAppliedVolts &middot; turnCurrentAmps|) / batteryVoltage</code>
+        sampled at the drive-current timestamps, with battery voltage held
+        from the nearest earlier sample.
+      </li>
+      <li>
+        <strong>Phase-detection fallback.</strong> If the DriverStation
+        <code>Enabled</code> / <code>Autonomous</code> entries are missing or
+        malformed and the match window can't be determined, the match-window
+        filter is bypassed and statistics fall back to the full log span.
+        The summary UI always shows the match boundaries it found, so you
+        can tell when this has happened.
+      </li>
+      <li>
+        <strong>Sim logs are excluded.</strong> Files whose name contains
+        <code>_sim</code> (case-insensitive) are skipped entirely from
+        listings and aggregates. Simulated telemetry contains synthetic
+        entries that don't exist on the real robot and would pollute event
+        dashboards.
+      </li>
+    </ul>
+  </main>
+
+  <footer class="wrap">
+    <p>
+      wpilog-stats — shares the wpilog-mcp log cache.
+      <a href="__BASE__/ui/" style="color:#60a5fa">Back to events</a>.
+    </p>
+  </footer>
+</body>
+</html>

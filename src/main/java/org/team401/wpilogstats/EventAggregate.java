@@ -21,6 +21,7 @@ class EventAggregate {
   // Current — per-log total current averages.
   private int currentLogs = 0;
   private double sumMeanTotalCurrent = 0.0;
+  private double sumP90TotalCurrent = 0.0;
   private double maxPeakTotalCurrent = 0.0;
 
   void accept(BatteryAnalyzer.BatterySummary battery, CurrentAnalyzer.CurrentSummary current) {
@@ -34,6 +35,7 @@ class EventAggregate {
     if (current != null && current.hasData()) {
       currentLogs++;
       sumMeanTotalCurrent += current.meanTotalCurrent();
+      sumP90TotalCurrent += current.p90TotalCurrent();
       maxPeakTotalCurrent = Math.max(maxPeakTotalCurrent, current.peakTotalCurrent());
     }
   }
@@ -54,6 +56,7 @@ class EventAggregate {
     current.addProperty("matchesAnalyzed", currentLogs);
     if (currentLogs > 0) {
       current.addProperty("avgMeanTotalCurrent", sumMeanTotalCurrent / currentLogs);
+      current.addProperty("avgP90TotalCurrent", sumP90TotalCurrent / currentLogs);
       current.addProperty("peakTotalCurrent", maxPeakTotalCurrent);
     }
     result.add("current", current);

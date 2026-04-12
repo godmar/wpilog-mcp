@@ -233,8 +233,10 @@ public class StatsServer {
         return;
       }
       byte[] bytes;
-      if ("index.html".equals(relative)) {
+      if (relative.toLowerCase().endsWith(".html")) {
         // Substitute the configured base path so asset URLs work under any mount point.
+        // Applied to every html file (index.html, help.html, …) so static pages can
+        // reference stylesheets and cross-links without hard-coding the prefix.
         String html = new String(in.readAllBytes(), StandardCharsets.UTF_8)
             .replace("__BASE__", basePath);
         bytes = html.getBytes(StandardCharsets.UTF_8);

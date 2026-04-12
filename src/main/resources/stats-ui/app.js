@@ -163,7 +163,8 @@
       strip.appendChild(stat("Lowest voltage", battAgg.overallMinVoltage !== undefined ? `${fmt(battAgg.overallMinVoltage)} V` : "—",
         battAgg.overallMinVoltage !== undefined && battAgg.overallMinVoltage < 6.8 ? "critical" : ""));
       strip.appendChild(stat("Brownout samples", fmtInt(battAgg.totalBrownoutSamples || 0)));
-      strip.appendChild(stat("Avg mean current", currAgg.matchesAnalyzed ? `${fmt(currAgg.avgMeanTotalCurrent)} A` : "—"));
+      strip.appendChild(stat("Avg in-match mean current", currAgg.matchesAnalyzed ? `${fmt(currAgg.avgMeanTotalCurrent)} A` : "—"));
+      strip.appendChild(stat("Avg in-match P90 current", currAgg.matchesAnalyzed ? `${fmt(currAgg.avgP90TotalCurrent)} A` : "—"));
       strip.appendChild(stat("Peak total current", currAgg.matchesAnalyzed ? `${fmt(currAgg.peakTotalCurrent)} A` : "—"));
       appEl.appendChild(strip);
 
@@ -174,7 +175,7 @@
       batteryChart.appendChild(batteryCanvas);
       appEl.appendChild(batteryChart);
 
-      appEl.appendChild(el("h3", {}, "Per-match current draw (mean + peak)"));
+      appEl.appendChild(el("h3", {}, "Per-match current draw (in-match: mean, P90, peak)"));
       const currentChart = el("div", { class: "chart-container" });
       const currentCanvas = el("canvas");
       currentChart.appendChild(currentCanvas);
@@ -185,6 +186,7 @@
       const minVolt = logs.map(l => l.battery && l.battery.available ? l.battery.minVoltage : null);
       const meanVolt = logs.map(l => l.battery && l.battery.available ? l.battery.meanVoltage : null);
       const meanCur = logs.map(l => l.current && l.current.available ? l.current.meanTotalCurrent : null);
+      const p90Cur = logs.map(l => l.current && l.current.available ? l.current.p90TotalCurrent : null);
       const peakCur = logs.map(l => l.current && l.current.available ? l.current.peakTotalCurrent : null);
 
       activeCharts.push(new Chart(batteryCanvas, {
@@ -205,6 +207,7 @@
           labels,
           datasets: [
             { label: "Peak total (A)", data: peakCur, backgroundColor: "#f97316" },
+            { label: "P90 total (A)", data: p90Cur, backgroundColor: "#facc15" },
             { label: "Mean total (A)", data: meanCur, backgroundColor: "#10b981" },
           ],
         },
@@ -222,6 +225,7 @@
         el("th", {}, "Mean V"),
         el("th", {}, "Brownouts"),
         el("th", {}, "Mean I (A)"),
+        el("th", {}, "P90 I (A)"),
         el("th", {}, "Peak I (A)"),
       ));
       table.appendChild(thead);
@@ -238,6 +242,7 @@
         tr.appendChild(el("td", { class: "num" }, l.battery && l.battery.available ? fmt(l.battery.meanVoltage) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.battery && l.battery.available ? fmtInt(l.battery.brownoutSamples) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.meanTotalCurrent) : "—"));
+        tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.p90TotalCurrent) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.peakTotalCurrent) : "—"));
         tbody.appendChild(tr);
       }
@@ -358,6 +363,7 @@
           el("th", {}, "Source"),
           el("th", {}, "Mean (A)"),
           el("th", {}, "RMS (A)"),
+          el("th", {}, "P90 (A)"),
           el("th", {}, "Peak (A)"),
           el("th", {}, "Samples"),
         ));
@@ -373,6 +379,7 @@
           tr.appendChild(srcCell);
           tr.appendChild(el("td", { class: "num" }, fmt(s.stats.mean)));
           tr.appendChild(el("td", { class: "num" }, fmt(s.stats.rms)));
+          tr.appendChild(el("td", { class: "num" }, fmt(s.stats.p90)));
           tr.appendChild(el("td", { class: "num" }, fmt(s.stats.peak)));
           tr.appendChild(el("td", { class: "num" }, fmtInt(s.stats.sampleCount)));
           tbody.appendChild(tr);
@@ -479,16 +486,28 @@
     const plugins = { legend: { labels: { color: "#cbd5e1" } } };
     const ann = phaseAnnotations(phases);
     if (ann) plugins.annotation = ann;
+    // Clip the visible x range to the match window (± 5 s) so pre-match
+    // setup and post-match idle don't dominate the chart. If we don't have
+    // a match start we leave the axis auto-ranged.
+    const xScale = {
+      type: "linear",
+      ticks: { color: "#94a3b8" },
+      title: { display: true, text: "Time (s)", color: "#cbd5e1" },
+      grid: { color: "#1e293b" },
+    };
+    if (phases && phases.matchStart != null && Number.isFinite(phases.matchStart)) {
+      xScale.min = phases.matchStart - 5;
+      if (phases.matchEnd != null && Number.isFinite(phases.matchEnd)) {
+        xScale.max = phases.matchEnd + 5;
+      }
+    }
     return {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
       plugins,
       scales: {
-        x: { type: "linear",
-             ticks: { color: "#94a3b8" },
-             title: { display: true, text: "Time (s)", color: "#cbd5e1" },
-             grid: { color: "#1e293b" } },
+        x: xScale,
         y: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" },
              title: { display: true, text: yLabel, color: "#cbd5e1" } },
       },

@@ -63,14 +63,15 @@ public final class MatchPhaseDetector {
     List<TimestampedValue> autoValues =
         autoEntry != null ? log.values().get(autoEntry) : null;
 
-    // Match start / end from enable transitions.
+    // Match start from the first enable transition. (matchEnd is computed
+    // later, after we know teleopStart, so the auto→teleop disable gap
+    // doesn't get mistaken for the end of the match.)
     Double firstEnable = null;
-    Double lastDisable = null;
     if (enabledValues != null) {
       for (var tv : enabledValues) {
-        if (tv.value() instanceof Boolean en) {
-          if (en && firstEnable == null) firstEnable = tv.timestamp();
-          if (!en && firstEnable != null) lastDisable = tv.timestamp();
+        if (tv.value() instanceof Boolean en && en) {
+          firstEnable = tv.timestamp();
+          break;
         }
       }
     }
@@ -128,12 +129,31 @@ public final class MatchPhaseDetector {
       teleopStart = autoEnd;
     }
 
-    Double teleopEnd = lastDisable;
+    // matchEnd / teleopEnd = first Enabled=false strictly after teleopStart.
+    // If the robot stays enabled through the end of the log (no final
+    // disable), fall back to the log's max timestamp so the chart still has
+    // a right edge. Any earlier disable (e.g. a brief mid-auto glitch) is NOT
+    // a valid "match end" — we explicitly avoid picking those.
+    Double matchEnd = null;
+    if (enabledValues != null && teleopStart != null) {
+      for (var tv : enabledValues) {
+        if (!(tv.value() instanceof Boolean en)) continue;
+        if (!en && tv.timestamp() > teleopStart) {
+          matchEnd = tv.timestamp();
+          break;
+        }
+      }
+      if (matchEnd == null) {
+        double maxTs = log.maxTimestamp();
+        if (maxTs > teleopStart) matchEnd = maxTs;
+      }
+    }
+    Double teleopEnd = matchEnd;
     // Sanity: teleopEnd must be after teleopStart, else treat as unknown.
     if (teleopStart != null && teleopEnd != null && teleopEnd <= teleopStart) {
       teleopEnd = null;
     }
 
-    return new MatchPhases(firstEnable, lastDisable, autoStart, autoEnd, teleopStart, teleopEnd);
+    return new MatchPhases(firstEnable, matchEnd, autoStart, autoEnd, teleopStart, teleopEnd);
   }
 }

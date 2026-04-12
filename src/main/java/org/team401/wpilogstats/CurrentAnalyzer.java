@@ -3,11 +3,13 @@ package org.team401.wpilogstats;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.team401.wpilogstats.MatchPhaseDetector.MatchPhases;
 import org.triplehelix.wpilogmcp.log.LogData;
 import org.triplehelix.wpilogmcp.log.TimestampedValue;
 
@@ -50,20 +52,24 @@ public class CurrentAnalyzer {
   // Public entry points
   // ======================================================================
 
-  public CurrentSummary summarize(LogData log) {
-    return analyze(log, false).summary();
+  public CurrentSummary summarize(LogData log, MatchPhases phases) {
+    return analyze(log, phases, false).summary();
   }
 
-  public CurrentDetail detail(LogData log) {
-    return analyze(log, true);
+  public CurrentDetail detail(LogData log, MatchPhases phases) {
+    return analyze(log, phases, true);
   }
 
   // ======================================================================
   // Core
   // ======================================================================
 
-  private CurrentDetail analyze(LogData log, boolean includeSeries) {
+  private CurrentDetail analyze(LogData log, MatchPhases phases, boolean includeSeries) {
     List<Subsystem> subsystems = new ArrayList<>();
+    // Parallel to `subsystems`: the match-filtered sample list we used to compute
+    // each subsystem's stats. We hold onto these so we can align them onto a
+    // common time grid below to compute *true* instantaneous totals.
+    List<List<Sample>> matchSampleLists = new ArrayList<>();
 
     var battery = findBatteryEntry(log);
 
@@ -72,13 +78,15 @@ public class CurrentAnalyzer {
     for (var module : modules) {
       var samples = computeSwerveSupplyCurrent(log, module, battery);
       if (samples.isEmpty()) continue;
-      var stats = stats(samples);
+      var inMatch = filterToMatch(samples, phases);
+      var stats = stats(inMatch);
       JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
       subsystems.add(new Subsystem(
           "Swerve " + module.label(),
           module.prefix() + "/(computed)",
           "swerve",
           stats, series));
+      matchSampleLists.add(inMatch);
     }
 
     // --- Direct supplyCurrentAmps entries ---
@@ -96,27 +104,106 @@ public class CurrentAnalyzer {
         samples.add(new Sample(tv.timestamp(), v));
       }
       if (samples.isEmpty()) continue;
-      var stats = stats(samples);
+      var inMatch = filterToMatch(samples, phases);
+      var stats = stats(inMatch);
       JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
       subsystems.add(new Subsystem(
           friendlyName(name),
           name,
           "direct",
           stats, series));
+      matchSampleLists.add(inMatch);
     }
+
+    // Build the instantaneous total-current time series by aligning every
+    // subsystem onto a common grid (the union of their timestamps) with
+    // zero-order hold between samples. This yields the *physically meaningful*
+    // peak/mean/p90 of what the battery actually saw — rather than a sum of
+    // independent per-subsystem extremes (which would overestimate, since
+    // subsystem peaks almost never land at the same instant).
+    var totalSeries = computeAlignedTotal(matchSampleLists);
+    var totalStats = stats(totalSeries);
 
     subsystems.sort(Comparator.comparingDouble((Subsystem s) -> s.stats.mean()).reversed());
 
-    double meanTotal = 0.0;
-    double peakTotal = 0.0;
-    for (var s : subsystems) {
-      meanTotal += s.stats.mean();
-      peakTotal += s.stats.peak();
-    }
-
-    var summary = new CurrentSummary(subsystems.size(), meanTotal, peakTotal,
+    var summary = new CurrentSummary(subsystems.size(),
+        totalStats.mean(), totalStats.peak(), totalStats.p90(),
         Collections.unmodifiableList(subsystems));
     return new CurrentDetail(summary);
+  }
+
+  /**
+   * K-way merge of per-subsystem sample streams into a single aligned
+   * total-current series. Every distinct timestamp across all streams becomes
+   * one output sample whose value is the sum of the latest-observed value from
+   * each stream (zero-order hold). Streams that have not yet produced any
+   * sample at a given time contribute 0, which is the honest choice — we have
+   * no evidence that subsystem was drawing anything.
+   *
+   * <p>Input lists must be sorted ascending by timestamp, which they already
+   * are (wpilog values come out in timestamp order, and {@link #filterToMatch}
+   * preserves order).
+   */
+  private static List<Sample> computeAlignedTotal(List<List<Sample>> sources) {
+    var lists = new ArrayList<List<Sample>>(sources.size());
+    for (var l : sources) if (!l.isEmpty()) lists.add(l);
+    if (lists.isEmpty()) return List.of();
+
+    int k = lists.size();
+    int[] cursor = new int[k];
+    double[] held = new double[k]; // Java default 0.0 = "nothing observed yet"
+    int totalSize = 0;
+    for (var l : lists) totalSize += l.size();
+    var result = new ArrayList<Sample>(totalSize);
+
+    while (true) {
+      // Find the smallest next timestamp across all streams that still have
+      // samples remaining. Linear scan is fine — k is the subsystem count,
+      // typically < 20.
+      double nextT = Double.POSITIVE_INFINITY;
+      for (int i = 0; i < k; i++) {
+        if (cursor[i] < lists.get(i).size()) {
+          double t = lists.get(i).get(cursor[i]).t;
+          if (t < nextT) nextT = t;
+        }
+      }
+      if (nextT == Double.POSITIVE_INFINITY) break;
+
+      // Advance every stream whose next sample lives at this exact timestamp.
+      // A single stream with duplicate timestamps collapses to the last value.
+      for (int i = 0; i < k; i++) {
+        var l = lists.get(i);
+        while (cursor[i] < l.size() && l.get(cursor[i]).t == nextT) {
+          held[i] = l.get(cursor[i]).v;
+          cursor[i]++;
+        }
+      }
+
+      double sum = 0.0;
+      for (int i = 0; i < k; i++) sum += held[i];
+      result.add(new Sample(nextT, sum));
+    }
+    return result;
+  }
+
+  /**
+   * Returns the sublist of {@code samples} whose timestamps fall within the match
+   * window {@code [matchStart, matchEnd]}. Falls back to the original list if the
+   * phases object is unavailable, has no bounds, or the filter would return empty
+   * (e.g. a subsystem that only logs outside the match).
+   */
+  private static List<Sample> filterToMatch(List<Sample> samples, MatchPhases phases) {
+    if (phases == null) return samples;
+    Double lo = phases.matchStart();
+    Double hi = phases.matchEnd();
+    if (lo == null && hi == null) return samples;
+    double loV = lo != null ? lo : Double.NEGATIVE_INFINITY;
+    double hiV = hi != null ? hi : Double.POSITIVE_INFINITY;
+    var result = new ArrayList<Sample>(samples.size());
+    for (var s : samples) {
+      if (s.t >= loV && s.t <= hiV) result.add(s);
+    }
+    return result.isEmpty() ? samples : result;
   }
 
   // ======================================================================
@@ -267,12 +354,32 @@ public class CurrentAnalyzer {
     double variance = n > 1 ? (sumSq - n * mean * mean) / (n - 1) : 0.0;
     double rms = Math.sqrt(sumSq / n);
     double stdDev = Math.sqrt(Math.max(0, variance));
-    return new Stats(n, min, max, mean, rms, stdDev);
+    double p90 = percentile(samples, 0.90);
+    return new Stats(n, min, max, mean, rms, stdDev, p90);
+  }
+
+  /**
+   * Linear-interpolated percentile (same method as numpy's default). Returns 0 for
+   * an empty input and the sole value for a single-sample input.
+   */
+  private static double percentile(List<Sample> samples, double p) {
+    int n = samples.size();
+    if (n == 0) return 0.0;
+    if (n == 1) return samples.get(0).v;
+    double[] values = new double[n];
+    for (int i = 0; i < n; i++) values[i] = samples.get(i).v;
+    Arrays.sort(values);
+    double rank = p * (n - 1);
+    int lo = (int) Math.floor(rank);
+    int hi = (int) Math.ceil(rank);
+    if (lo == hi) return values[lo];
+    double frac = rank - lo;
+    return values[lo] + frac * (values[hi] - values[lo]);
   }
 
   private record Stats(int count, double min, double peak, double mean,
-                       double rms, double stdDev) {
-    static Stats empty() { return new Stats(0, 0, 0, 0, 0, 0); }
+                       double rms, double stdDev, double p90) {
+    static Stats empty() { return new Stats(0, 0, 0, 0, 0, 0, 0); }
 
     JsonObject toJson() {
       var o = new JsonObject();
@@ -283,6 +390,7 @@ public class CurrentAnalyzer {
       o.addProperty("mean", mean);
       o.addProperty("rms", rms);
       o.addProperty("stdDev", stdDev);
+      o.addProperty("p90", p90);
       return o;
     }
   }
@@ -462,19 +570,22 @@ public class CurrentAnalyzer {
     private final int subsystemCount;
     private final double meanTotalCurrent;
     private final double peakTotalCurrent;
+    private final double p90TotalCurrent;
     private final List<Subsystem> subsystems;
 
     CurrentSummary(int subsystemCount, double meanTotalCurrent, double peakTotalCurrent,
-                   List<Subsystem> subsystems) {
+                   double p90TotalCurrent, List<Subsystem> subsystems) {
       this.subsystemCount = subsystemCount;
       this.meanTotalCurrent = meanTotalCurrent;
       this.peakTotalCurrent = peakTotalCurrent;
+      this.p90TotalCurrent = p90TotalCurrent;
       this.subsystems = subsystems;
     }
 
     public boolean hasData() { return subsystemCount > 0; }
     public double meanTotalCurrent() { return meanTotalCurrent; }
     public double peakTotalCurrent() { return peakTotalCurrent; }
+    public double p90TotalCurrent() { return p90TotalCurrent; }
 
     public JsonObject toJson() {
       var o = new JsonObject();
@@ -482,6 +593,7 @@ public class CurrentAnalyzer {
       o.addProperty("subsystemCount", subsystemCount);
       o.addProperty("meanTotalCurrent", meanTotalCurrent);
       o.addProperty("peakTotalCurrent", peakTotalCurrent);
+      o.addProperty("p90TotalCurrent", p90TotalCurrent);
       var arr = new JsonArray();
       for (var s : subsystems) arr.add(s.toJson());
       o.add("subsystems", arr);
