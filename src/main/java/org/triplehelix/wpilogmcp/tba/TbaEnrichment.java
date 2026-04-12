@@ -1,5 +1,6 @@
 package org.triplehelix.wpilogmcp.tba;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -217,6 +218,31 @@ public class TbaEnrichment {
         var opponent = alliances.getAsJsonObject(opponentAlliance);
         if (opponent != null && opponent.has("score")) {
           tba.addProperty("opponent_score", opponent.get("score").getAsInt());
+        }
+      }
+
+      // Include TBA match key for linking to the match page
+      if (match.has("key") && !match.get("key").isJsonNull()) {
+        tba.addProperty("match_key", match.get("key").getAsString());
+      }
+
+      // Include video links (typically YouTube streams)
+      if (match.has("videos") && match.get("videos").isJsonArray()) {
+        var videos = new JsonArray();
+        for (var videoEl : match.getAsJsonArray("videos")) {
+          if (!videoEl.isJsonObject()) continue;
+          var video = videoEl.getAsJsonObject();
+          var type = video.has("type") ? video.get("type").getAsString() : "";
+          var key = video.has("key") ? video.get("key").getAsString() : "";
+          if (!key.isEmpty()) {
+            var v = new JsonObject();
+            v.addProperty("type", type);
+            v.addProperty("key", key);
+            videos.add(v);
+          }
+        }
+        if (videos.size() > 0) {
+          tba.add("videos", videos);
         }
       }
     }

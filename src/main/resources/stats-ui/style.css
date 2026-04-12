@@ -167,3 +167,29 @@ table td.num {
 }
 .pill.swerve { background: #1e3a8a; color: #bfdbfe; }
 .pill.direct { background: #064e3b; color: #a7f3d0; }
+
+/* TBA match result styling */
+td.tba-win { color: #4ade80; }
+td.tba-loss { color: #f87171; }
+.result-tag {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  letter-spacing: 0.03em;
+}
+.result-tag.win { background: #166534; color: #bbf7d0; }
+.result-tag.loss { background: #7f1d1d; color: #fecaca; }
+td.tba-links {
+  white-space: nowrap;
+}
+td.tba-links a {
+  color: #60a5fa;
+  text-decoration: none;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+td.tba-links a:hover { text-decoration: underline; }

@@ -216,9 +216,11 @@
 
       // Log table
       appEl.appendChild(el("h3", {}, "Logs"));
+      // Check if any logs have TBA data to decide whether to show TBA columns
+      const hasTba = logs.some(l => l.tba);
       const table = el("table");
       const thead = el("thead");
-      thead.appendChild(el("tr", {},
+      const headerRow = el("tr", {},
         el("th", {}, "Log"),
         el("th", {}, "Duration (s)"),
         el("th", {}, "Min V"),
@@ -227,7 +229,12 @@
         el("th", {}, "Mean I (A)"),
         el("th", {}, "P90 I (A)"),
         el("th", {}, "Peak I (A)"),
-      ));
+      );
+      if (hasTba) {
+        headerRow.appendChild(el("th", {}, "Score"));
+        headerRow.appendChild(el("th", {}, "Links"));
+      }
+      thead.appendChild(headerRow);
       table.appendChild(thead);
       const tbody = el("tbody");
       for (const l of logs) {
@@ -244,6 +251,10 @@
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.meanTotalCurrent) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.p90TotalCurrent) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.peakTotalCurrent) : "—"));
+        if (hasTba) {
+          tr.appendChild(tbaScoreCell(l.tba));
+          tr.appendChild(tbaLinksCell(l.tba));
+        }
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
@@ -578,6 +589,48 @@
   function lastComponent(relPath) {
     const parts = relPath.split("/");
     return parts[parts.length - 1];
+  }
+
+  // --- TBA helpers --------------------------------------------------------
+  function tbaScoreCell(tba) {
+    if (!tba) return el("td", {}, "—");
+    const score = tba.score;
+    const opponentScore = tba.opponent_score;
+    const won = tba.won;
+    const text = opponentScore != null ? `${score}–${opponentScore}` : `${score}`;
+    const cls = won === true ? "tba-win" : won === false ? "tba-loss" : "";
+    const td = el("td", { class: "num " + cls });
+    td.appendChild(document.createTextNode(text));
+    if (won === true) td.appendChild(el("span", { class: "result-tag win" }, "W"));
+    else if (won === false) td.appendChild(el("span", { class: "result-tag loss" }, "L"));
+    return td;
+  }
+  function tbaLinksCell(tba) {
+    if (!tba) return el("td", {}, "");
+    const td = el("td", { class: "tba-links" });
+    if (tba.match_key) {
+      td.appendChild(el("a", {
+        href: `https://www.thebluealliance.com/match/${tba.match_key}`,
+        target: "_blank",
+        rel: "noopener",
+        title: "View on The Blue Alliance",
+      }, "TBA"));
+    }
+    if (tba.videos && tba.videos.length > 0) {
+      for (const v of tba.videos) {
+        if (td.childNodes.length > 0) td.appendChild(document.createTextNode(" "));
+        const url = v.type === "youtube"
+          ? `https://www.youtube.com/watch?v=${v.key}`
+          : v.key;
+        td.appendChild(el("a", {
+          href: url,
+          target: "_blank",
+          rel: "noopener",
+          title: "Watch match video",
+        }, "YT"));
+      }
+    }
+    return td;
   }
 
   // --- Router ------------------------------------------------------------

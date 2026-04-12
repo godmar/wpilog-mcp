@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.triplehelix.wpilogmcp.log.LogDirectory;
 import org.triplehelix.wpilogmcp.log.LogManager;
+import org.triplehelix.wpilogmcp.tba.TbaClient;
 
 /**
  * Entry point for the wpilog-stats web application.
@@ -45,6 +46,15 @@ public class StatsMain {
       } catch (NumberFormatException e) {
         logger.warn("Invalid WPILOG_TEAM: {}", envTeam);
       }
+    }
+
+    // Initialize TBA client for match enrichment (score, videos, links)
+    String tbaKey = System.getenv("TBA_API_KEY");
+    if (tbaKey != null && !tbaKey.isEmpty()) {
+      TbaClient.getInstance().configure(tbaKey);
+      logger.info("TBA API configured for match enrichment");
+    } else {
+      logger.info("TBA_API_KEY not set — match scores and videos will not be available");
     }
 
     var server = new StatsServer(Path.of(logDir), bind, port, basePath);

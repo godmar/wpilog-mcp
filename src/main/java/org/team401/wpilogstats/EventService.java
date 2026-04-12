@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import org.triplehelix.wpilogmcp.log.LogData;
 import org.triplehelix.wpilogmcp.log.LogDirectory;
 import org.triplehelix.wpilogmcp.log.LogManager;
+import org.triplehelix.wpilogmcp.tba.TbaEnrichment;
 
 /**
  * Service that walks the logs root directory, enumerates events (top-level subdirectories
@@ -130,6 +131,19 @@ public class EventService {
         entry.addProperty("duration", log.duration());
         entry.add("battery", batteryStats.toJson());
         entry.add("current", currentSummary.toJson());
+
+        // TBA enrichment: match score, result, videos, TBA link
+        String absKey = path.toAbsolutePath().normalize().toString();
+        var logInfo = metadataByPath.get(absKey);
+        if (logInfo != null) {
+          try {
+            TbaEnrichment.getInstance().enrichLog(logInfo)
+                .ifPresent(tba -> entry.add("tba", tba));
+          } catch (Exception e) {
+            logger.debug("TBA enrichment failed for {}: {}", path, e.getMessage());
+          }
+        }
+
         perLog.add(entry);
 
         aggregate.accept(batteryStats, currentSummary);
