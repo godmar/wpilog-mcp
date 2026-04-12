@@ -334,6 +334,62 @@
         }));
       }
 
+      // Aligned total current over time. This is the single series whose
+      // stats drive the "Peak/Mean/P90 total" numbers — built by merging
+      // every subsystem onto a common time grid with zero-order hold and
+      // summing. See the Help page for the full algorithm.
+      if (current.available) {
+        const totalStrip = el("div", { class: "stats-strip" });
+        totalStrip.appendChild(stat("Peak total current", `${fmt(current.peakTotalCurrent)} A`));
+        totalStrip.appendChild(stat("P90 total current", `${fmt(current.p90TotalCurrent)} A`));
+        totalStrip.appendChild(stat("Mean total current", `${fmt(current.meanTotalCurrent)} A`));
+        appEl.appendChild(totalStrip);
+
+        if (current.totalSeries && current.totalSeries.length > 0) {
+          appEl.appendChild(el("h3", {}, "Total current over time (aligned)"));
+          const totalBox = el("div", { class: "chart-container" });
+          const totalCanvas = el("canvas");
+          totalBox.appendChild(totalCanvas);
+          appEl.appendChild(totalBox);
+          // Two overlaid datasets on the same axes:
+          //   - raw aligned total — thin, faint orange with a light fill
+          //     so spikes are visible but don't shout over the smoothed line
+          //   - 1 s time-weighted trailing mean — thicker amber line,
+          //     drawn on top (`order: 1` < raw's `order: 2`)
+          const datasets = [
+            {
+              label: "Total (raw)",
+              data: current.totalSeries.map(([t, v]) => ({ x: t, y: v })),
+              borderColor: "rgba(249, 115, 22, 0.55)",
+              backgroundColor: "rgba(249, 115, 22, 0.10)",
+              borderWidth: 1,
+              pointRadius: 0,
+              tension: 0,
+              fill: true,
+              order: 2,
+            },
+          ];
+          if (current.totalSmoothedSeries && current.totalSmoothedSeries.length > 0) {
+            datasets.push({
+              label: "1 s trailing mean",
+              data: current.totalSmoothedSeries.map(([t, v]) => ({ x: t, y: v })),
+              borderColor: "#fbbf24",
+              backgroundColor: "transparent",
+              borderWidth: 2,
+              pointRadius: 0,
+              tension: 0,
+              fill: false,
+              order: 1,
+            });
+          }
+          activeCharts.push(new Chart(totalCanvas, {
+            type: "line",
+            data: { datasets },
+            options: timeSeriesOptions("Current (A)", phases),
+          }));
+        }
+      }
+
       // Current subsystems
       if (current.available && current.subsystems && current.subsystems.length > 0) {
         appEl.appendChild(el("h3", {}, "Current draw by subsystem"));

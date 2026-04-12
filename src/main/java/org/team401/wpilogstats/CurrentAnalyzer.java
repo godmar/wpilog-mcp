@@ -40,6 +40,11 @@ import org.triplehelix.wpilogmcp.log.TimestampedValue;
 public class CurrentAnalyzer {
 
   private static final int TIME_SERIES_MAX_POINTS = 1500;
+  // Window used for the "smoothed" overlay on the total-current chart.
+  // 1 s hides single-shot / single-acceleration spikes while still showing
+  // match-cadence trends (drive bursts, endgame pull). Kept out of the
+  // stats: peak/mean/p90 are still computed on the raw aligned series.
+  private static final double TOTAL_SMOOTHING_WINDOW_SECONDS = 1.0;
 
   // Entry suffixes used for swerve module detection.
   private static final String DRIVE_VOLT_SUFFIX = "driveappliedvolts";
@@ -121,15 +126,83 @@ public class CurrentAnalyzer {
     // peak/mean/p90 of what the battery actually saw — rather than a sum of
     // independent per-subsystem extremes (which would overestimate, since
     // subsystem peaks almost never land at the same instant).
-    var totalSeries = computeAlignedTotal(matchSampleLists);
-    var totalStats = stats(totalSeries);
+    var totalSamples = computeAlignedTotal(matchSampleLists);
+    var totalStats = stats(totalSamples);
+    // On the detail path we also surface the series itself so the UI can
+    // draw a "total current over time" chart using the exact same number
+    // the summary's peak/mean/p90 are computed from. The smoothed overlay
+    // is a time-weighted trailing mean — *only* for visualization, never
+    // fed back into the stats.
+    JsonArray totalSeries = null;
+    JsonArray totalSmoothedSeries = null;
+    if (includeSeries) {
+      totalSeries = downsampleSamples(totalSamples, TIME_SERIES_MAX_POINTS);
+      var smoothed = rollingMeanByTime(totalSamples, TOTAL_SMOOTHING_WINDOW_SECONDS);
+      if (!smoothed.isEmpty()) {
+        totalSmoothedSeries = downsampleSamples(smoothed, TIME_SERIES_MAX_POINTS);
+      }
+    }
 
     subsystems.sort(Comparator.comparingDouble((Subsystem s) -> s.stats.mean()).reversed());
 
     var summary = new CurrentSummary(subsystems.size(),
         totalStats.mean(), totalStats.peak(), totalStats.p90(),
-        Collections.unmodifiableList(subsystems));
+        Collections.unmodifiableList(subsystems), totalSeries, totalSmoothedSeries);
     return new CurrentDetail(summary);
+  }
+
+  /**
+   * Time-weighted trailing rolling mean of a piecewise-constant (zero-order
+   * hold) signal. For each input sample at timestamp {@code t_i}, returns a
+   * sample whose value is the time-weighted average of the signal over the
+   * interval {@code [max(t_0, t_i - W), t_i]}.
+   *
+   * <p>This is the right formulation for our irregularly-sampled aligned
+   * total series: a naive "trailing N samples" mean would over-weight
+   * moments where many subsystems happen to update simultaneously. Here
+   * every millisecond of match time contributes equally, regardless of
+   * sampling density.
+   *
+   * <p>Implementation uses a precomputed prefix-integral of the ZOH
+   * signal plus a forward-only cursor for the window's left edge, giving
+   * O(n) total work.
+   */
+  private static List<Sample> rollingMeanByTime(List<Sample> samples, double windowSeconds) {
+    int n = samples.size();
+    if (n == 0) return List.of();
+    if (n == 1) return List.of(samples.get(0));
+
+    // integral[k] = ∫_{t_0}^{t_k} value(u) du under ZOH interpretation.
+    // Since value on [t_{k-1}, t_k) = v_{k-1}, the recurrence is:
+    //   integral[k] = integral[k-1] + v_{k-1} · (t_k − t_{k-1}).
+    double[] integral = new double[n];
+    for (int k = 1; k < n; k++) {
+      integral[k] = integral[k - 1]
+          + samples.get(k - 1).v * (samples.get(k).t - samples.get(k - 1).t);
+    }
+
+    double t0 = samples.get(0).t;
+    var result = new ArrayList<Sample>(n);
+    // cursor = largest index j such that samples[j].t <= windowStart.
+    // Advances monotonically as windowStart advances with i.
+    int cursor = 0;
+    for (int i = 0; i < n; i++) {
+      double ti = samples.get(i).t;
+      double windowStart = Math.max(t0, ti - windowSeconds);
+      while (cursor + 1 < n && samples.get(cursor + 1).t <= windowStart) cursor++;
+
+      // value(windowStart) is the value held on the interval that
+      // includes windowStart, i.e. samples[cursor].v.
+      double integralAtWindowStart = integral[cursor]
+          + samples.get(cursor).v * (windowStart - samples.get(cursor).t);
+      double integralAtTi = integral[i];
+      double duration = ti - windowStart;
+      double mean = duration > 0
+          ? (integralAtTi - integralAtWindowStart) / duration
+          : samples.get(i).v;
+      result.add(new Sample(ti, mean));
+    }
+    return result;
   }
 
   /**
@@ -572,14 +645,24 @@ public class CurrentAnalyzer {
     private final double peakTotalCurrent;
     private final double p90TotalCurrent;
     private final List<Subsystem> subsystems;
+    // Downsampled aligned total-current series (one (t, amps) point per
+    // bucket). Nullable — only populated on the detail path where the UI
+    // actually draws a chart from it.
+    private final JsonArray totalSeries;
+    // 1-second time-weighted trailing mean of the total series, downsampled
+    // the same way. Visualization overlay only; never used for stats.
+    private final JsonArray totalSmoothedSeries;
 
     CurrentSummary(int subsystemCount, double meanTotalCurrent, double peakTotalCurrent,
-                   double p90TotalCurrent, List<Subsystem> subsystems) {
+                   double p90TotalCurrent, List<Subsystem> subsystems,
+                   JsonArray totalSeries, JsonArray totalSmoothedSeries) {
       this.subsystemCount = subsystemCount;
       this.meanTotalCurrent = meanTotalCurrent;
       this.peakTotalCurrent = peakTotalCurrent;
       this.p90TotalCurrent = p90TotalCurrent;
       this.subsystems = subsystems;
+      this.totalSeries = totalSeries;
+      this.totalSmoothedSeries = totalSmoothedSeries;
     }
 
     public boolean hasData() { return subsystemCount > 0; }
@@ -594,6 +677,8 @@ public class CurrentAnalyzer {
       o.addProperty("meanTotalCurrent", meanTotalCurrent);
       o.addProperty("peakTotalCurrent", peakTotalCurrent);
       o.addProperty("p90TotalCurrent", p90TotalCurrent);
+      if (totalSeries != null) o.add("totalSeries", totalSeries);
+      if (totalSmoothedSeries != null) o.add("totalSmoothedSeries", totalSmoothedSeries);
       var arr = new JsonArray();
       for (var s : subsystems) arr.add(s.toJson());
       o.add("subsystems", arr);

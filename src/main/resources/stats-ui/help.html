@@ -137,8 +137,43 @@
 
     <h3 id="total-current">Total current: mean, peak, P90</h3>
     <p>
-      The summary page reports three rolled-up figures for "what the battery
-      saw":
+      Each log page shows a <strong>"Total current over time (aligned)"</strong>
+      chart: the exact time series whose mean, peak, and P90 are reported
+      in the stat strip above it. Every point on that chart is the sum of
+      every subsystem's most recent observed current at that instant — not
+      a single raw channel from the log. This is the one chart to look at
+      if you want to know what the battery actually saw.
+    </p>
+    <p>
+      The chart has two overlaid traces:
+    </p>
+    <ul>
+      <li>
+        <strong>Raw total</strong> (faint orange with a light fill) — the
+        instantaneous aligned total at every distinct timestamp in any
+        subsystem. Every spike is real.
+      </li>
+      <li>
+        <strong>1&nbsp;s trailing mean</strong> (bold amber) — a
+        <em>time-weighted</em> rolling average over the last one second of
+        the raw signal. Computed on the full pre-downsample series and then
+        downsampled alongside the raw trace so the two remain coherent.
+        Visualization only — peak/mean/P90 in the stat strip are still
+        computed on the raw aligned series, so the rolling mean never
+        sneaks into the numbers you'd compare against battery limits.
+      </li>
+    </ul>
+    <p>
+      The 1&nbsp;s window hides single-shot / single-acceleration spikes
+      while still showing match-cadence trends (drive bursts, auto vs
+      teleop vs endgame shifts). Using a <em>time-weighted</em> mean (not
+      "trailing N samples") is important because the raw series has
+      irregular timestamps — a count-weighted mean would over-count dense
+      update moments where many subsystems happen to change at once.
+    </p>
+    <p>
+      The stat strip reports three rolled-up figures derived from that same
+      series:
     </p>
     <ul>
       <li>
