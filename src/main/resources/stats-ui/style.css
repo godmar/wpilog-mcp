@@ -156,6 +156,7 @@ table td.num {
 }
 .stat.warn .value { color: #f97316; }
 .stat.critical .value { color: #ef4444; }
+.stat.good .value { color: #4ade80; }
 .pill {
   display: inline-block;
   background: #334155;

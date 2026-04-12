@@ -292,6 +292,42 @@
       }
       appEl.appendChild(el("p", { class: "meta" }, metaParts.join(" · ")));
 
+      // TBA match info strip
+      if (data.tba) {
+        const tba = data.tba;
+        const tbaStrip = el("div", { class: "stats-strip" });
+        const scoreText = tba.opponent_score != null
+          ? `${tba.score}–${tba.opponent_score}` : `${tba.score}`;
+        const resultCls = tba.won === true ? "win" : tba.won === false ? "loss" : "";
+        const resultLabel = tba.won === true ? "Win" : tba.won === false ? "Loss" : "—";
+        tbaStrip.appendChild(stat("Score", scoreText));
+        tbaStrip.appendChild(stat("Result", resultLabel, resultCls === "win" ? "good" : resultCls === "loss" ? "critical" : ""));
+        tbaStrip.appendChild(stat("Alliance", tba.alliance || "—"));
+        // Links
+        const linksDiv = el("div", { class: "stat" },
+          el("div", { class: "label" }, "LINKS"));
+        const linksValue = el("div", { class: "value tba-links" });
+        if (tba.match_key) {
+          linksValue.appendChild(el("a", {
+            href: `https://www.thebluealliance.com/match/${tba.match_key}`,
+            target: "_blank", rel: "noopener", title: "View on The Blue Alliance",
+          }, "TBA"));
+        }
+        if (tba.videos && tba.videos.length > 0) {
+          for (const v of tba.videos) {
+            if (linksValue.childNodes.length > 0) linksValue.appendChild(document.createTextNode(" "));
+            const url = v.type === "youtube"
+              ? `https://www.youtube.com/watch?v=${v.key}` : v.key;
+            linksValue.appendChild(el("a", {
+              href: url, target: "_blank", rel: "noopener", title: "Watch match video",
+            }, "YouTube"));
+          }
+        }
+        linksDiv.appendChild(linksValue);
+        tbaStrip.appendChild(linksDiv);
+        appEl.appendChild(tbaStrip);
+      }
+
       const battery = data.battery || {};
       const current = data.current || {};
 

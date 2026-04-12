@@ -204,6 +204,20 @@ public class EventService {
     result.add("battery", batteryAnalyzer.detail(log).toJson());
     result.add("current", currentAnalyzer.detail(log, phases).toJson());
     result.add("phases", phasesJson(phases));
+
+    // TBA enrichment: match score, result, videos, TBA link
+    var metadataByPath = loadMetadataIndex();
+    String absKey = logPath.toAbsolutePath().normalize().toString();
+    var logInfo = metadataByPath.get(absKey);
+    if (logInfo != null) {
+      try {
+        TbaEnrichment.getInstance().enrichLog(logInfo)
+            .ifPresent(tba -> result.add("tba", tba));
+      } catch (Exception e) {
+        logger.debug("TBA enrichment failed for {}: {}", logPath, e.getMessage());
+      }
+    }
+
     return result;
   }
 
