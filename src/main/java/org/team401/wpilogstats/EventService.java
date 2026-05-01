@@ -133,17 +133,8 @@ public class EventService {
         entry.add("battery", batteryStats.toJson());
         entry.add("current", currentSummary.toJson());
 
-        // TBA enrichment: match score, result, videos, TBA link
-        String absKey = path.toAbsolutePath().normalize().toString();
-        var logInfo = metadataByPath.get(absKey);
-        if (logInfo != null) {
-          try {
-            TbaEnrichment.getInstance().enrichLog(logInfo)
-                .ifPresent(tba -> entry.add("tba", tba));
-          } catch (Exception e) {
-            logger.debug("TBA enrichment failed for {}: {}", path, e.getMessage());
-          }
-        }
+        // TBA enrichment is loaded asynchronously via /api/tba/events/{event} so a
+        // slow Blue Alliance API never blocks the initial page render.
 
         perLog.add(entry);
 
@@ -207,7 +198,64 @@ public class EventService {
     result.add("vision", visionAnalyzer.summarize(log, phases));
     result.add("phases", phasesJson(phases));
 
-    // TBA enrichment: match score, result, videos, TBA link
+    // TBA enrichment is loaded asynchronously via /api/tba/logs/{event}/{name} so a
+    // slow Blue Alliance API never blocks the initial page render.
+
+    return result;
+  }
+
+  // ======================================================================
+  // TBA enrichment (loaded asynchronously by the UI)
+  // ======================================================================
+
+  /**
+   * Per-log TBA data for every log in an event. Returned as a map keyed by the same
+   * relative {@code file} string used elsewhere so the UI can patch rows in place.
+   * Logs without TBA data are simply omitted from the map.
+   */
+  public JsonObject tbaForEvent(String eventName) throws IOException {
+    Path eventDir = resolveEvent(eventName);
+    var logFiles = findLogs(eventDir);
+    var metadataByPath = loadMetadataIndex();
+
+    var result = new JsonObject();
+    result.addProperty("event", eventName);
+    var byFile = new JsonObject();
+    for (var path : logFiles) {
+      String absKey = path.toAbsolutePath().normalize().toString();
+      var logInfo = metadataByPath.get(absKey);
+      if (logInfo == null) continue;
+      try {
+        TbaEnrichment.getInstance().enrichLog(logInfo)
+            .ifPresent(tba -> byFile.add(relativeName(path), tba));
+      } catch (Exception e) {
+        logger.debug("TBA enrichment failed for {}: {}", path, e.getMessage());
+      }
+    }
+    result.add("byFile", byFile);
+    return result;
+  }
+
+  /**
+   * TBA data for a single log, or an empty {@code tba} key when none is available.
+   */
+  public JsonObject tbaForLog(String eventName, String logName) throws IOException {
+    Path eventDir = resolveEvent(eventName);
+    Path logPath = eventDir.resolve(logName).toAbsolutePath().normalize();
+    if (!logPath.startsWith(eventDir)) {
+      throw new IllegalArgumentException("Log path escapes event directory: " + logName);
+    }
+    if (!Files.isRegularFile(logPath)) {
+      logPath = findNested(eventDir, logName);
+      if (logPath == null) {
+        throw new IllegalArgumentException("Log not found: " + eventName + "/" + logName);
+      }
+    }
+
+    var result = new JsonObject();
+    result.addProperty("event", eventName);
+    result.addProperty("file", relativeName(logPath));
+
     var metadataByPath = loadMetadataIndex();
     String absKey = logPath.toAbsolutePath().normalize().toString();
     var logInfo = metadataByPath.get(absKey);
@@ -219,7 +267,6 @@ public class EventService {
         logger.debug("TBA enrichment failed for {}: {}", logPath, e.getMessage());
       }
     }
-
     return result;
   }
 

@@ -141,6 +141,23 @@ public class StatsServer {
           handleLogDetail(exchange, event, logName);
           return;
         }
+        if (rel.startsWith("api/tba/events/")) {
+          String event = decode(rel.substring("api/tba/events/".length()));
+          handleEventTba(exchange, event);
+          return;
+        }
+        if (rel.startsWith("api/tba/logs/")) {
+          String remainder = rel.substring("api/tba/logs/".length());
+          int slash = remainder.indexOf('/');
+          if (slash < 0) {
+            sendText(exchange, 400, "Expected /api/tba/logs/<event>/<logfile>");
+            return;
+          }
+          String event = decode(remainder.substring(0, slash));
+          String logName = decode(remainder.substring(slash + 1));
+          handleLogTba(exchange, event, logName);
+          return;
+        }
 
         // Static UI files (served under {base}/ui/).
         if (rel.equals("ui") || rel.equals("ui/")) {
@@ -209,6 +226,31 @@ public class StatsServer {
     } catch (Exception e) {
       logger.warn("Log detail failed for {}/{}: {}", event, logName, e.toString(), e);
       sendText(exchange, 500, "Failed to analyze log: " + e.getMessage());
+    }
+  }
+
+  private void handleEventTba(HttpExchange exchange, String event) throws IOException {
+    try {
+      var tba = eventService.tbaForEvent(event);
+      sendJson(exchange, 200, tba);
+    } catch (IllegalArgumentException e) {
+      sendText(exchange, 404, e.getMessage());
+    } catch (Exception e) {
+      logger.warn("Event TBA failed for {}: {}", event, e.toString(), e);
+      sendText(exchange, 500, "Failed to load TBA data: " + e.getMessage());
+    }
+  }
+
+  private void handleLogTba(HttpExchange exchange, String event, String logName)
+      throws IOException {
+    try {
+      var tba = eventService.tbaForLog(event, logName);
+      sendJson(exchange, 200, tba);
+    } catch (IllegalArgumentException e) {
+      sendText(exchange, 404, e.getMessage());
+    } catch (Exception e) {
+      logger.warn("Log TBA failed for {}/{}: {}", event, logName, e.toString(), e);
+      sendText(exchange, 500, "Failed to load TBA data: " + e.getMessage());
     }
   }
 

@@ -214,10 +214,9 @@
         options: sharedChartOptions("Current (A)"),
       }));
 
-      // Log table
+      // Log table. TBA Score/Links columns are appended asynchronously below
+      // so a slow Blue Alliance API never blocks the initial render.
       appEl.appendChild(el("h3", {}, "Logs"));
-      // Check if any logs have TBA data to decide whether to show TBA columns
-      const hasTba = logs.some(l => l.tba);
       const table = el("table");
       const thead = el("thead");
       const headerRow = el("tr", {},
@@ -230,15 +229,11 @@
         el("th", {}, "P90 I (A)"),
         el("th", {}, "Peak I (A)"),
       );
-      if (hasTba) {
-        headerRow.appendChild(el("th", {}, "Score"));
-        headerRow.appendChild(el("th", {}, "Links"));
-      }
       thead.appendChild(headerRow);
       table.appendChild(thead);
       const tbody = el("tbody");
       for (const l of logs) {
-        const tr = el("tr");
+        const tr = el("tr", { "data-file": l.file });
         const nameCell = el("td");
         nameCell.appendChild(el("a", {
           href: `${BASE}/${encodeURIComponent(eventName)}/${encodeURIComponent(lastComponent(l.file))}`,
@@ -251,14 +246,12 @@
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.meanTotalCurrent) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.p90TotalCurrent) : "—"));
         tr.appendChild(el("td", { class: "num" }, l.current && l.current.available ? fmt(l.current.peakTotalCurrent) : "—"));
-        if (hasTba) {
-          tr.appendChild(tbaScoreCell(l.tba));
-          tr.appendChild(tbaLinksCell(l.tba));
-        }
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
       appEl.appendChild(table);
+
+      loadEventTbaAsync(eventName, table);
     } catch (e) {
       showError(e);
     }
@@ -292,41 +285,12 @@
       }
       appEl.appendChild(el("p", { class: "meta" }, metaParts.join(" · ")));
 
-      // TBA match info strip
-      if (data.tba) {
-        const tba = data.tba;
-        const tbaStrip = el("div", { class: "stats-strip" });
-        const scoreText = tba.opponent_score != null
-          ? `${tba.score}–${tba.opponent_score}` : `${tba.score}`;
-        const resultCls = tba.won === true ? "win" : tba.won === false ? "loss" : "";
-        const resultLabel = tba.won === true ? "Win" : tba.won === false ? "Loss" : "—";
-        tbaStrip.appendChild(stat("Score", scoreText));
-        tbaStrip.appendChild(stat("Result", resultLabel, resultCls === "win" ? "good" : resultCls === "loss" ? "critical" : ""));
-        tbaStrip.appendChild(stat("Alliance", tba.alliance || "—"));
-        // Links
-        const linksDiv = el("div", { class: "stat" },
-          el("div", { class: "label" }, "LINKS"));
-        const linksValue = el("div", { class: "value tba-links" });
-        if (tba.match_key) {
-          linksValue.appendChild(el("a", {
-            href: `https://www.thebluealliance.com/match/${tba.match_key}`,
-            target: "_blank", rel: "noopener", title: "View on The Blue Alliance",
-          }, "TBA"));
-        }
-        if (tba.videos && tba.videos.length > 0) {
-          for (const v of tba.videos) {
-            if (linksValue.childNodes.length > 0) linksValue.appendChild(document.createTextNode(" "));
-            const url = v.type === "youtube"
-              ? `https://www.youtube.com/watch?v=${v.key}` : v.key;
-            linksValue.appendChild(el("a", {
-              href: url, target: "_blank", rel: "noopener", title: "Watch match video",
-            }, "YouTube"));
-          }
-        }
-        linksDiv.appendChild(linksValue);
-        tbaStrip.appendChild(linksDiv);
-        appEl.appendChild(tbaStrip);
-      }
+      // TBA match info strip is loaded asynchronously by loadLogTbaAsync below
+      // so a slow Blue Alliance API never blocks the initial render. We reserve
+      // a placeholder slot here so the strip lands in the right DOM position.
+      const tbaSlot = el("div", { id: "tba-slot" });
+      appEl.appendChild(tbaSlot);
+      loadLogTbaAsync(eventName, logName, tbaSlot);
 
       const battery = data.battery || {};
       const current = data.current || {};
@@ -746,6 +710,81 @@
   function lastComponent(relPath) {
     const parts = relPath.split("/");
     return parts[parts.length - 1];
+  }
+
+  // --- Async TBA loaders --------------------------------------------------
+  // These fire in the background after the main page renders so a slow Blue
+  // Alliance API never blocks the initial paint. If the user navigates away
+  // before the response arrives, the patch step is a no-op because the target
+  // element is no longer in the DOM.
+
+  async function loadEventTbaAsync(eventName, table) {
+    let data;
+    try {
+      data = await fetchJson(`${BASE}/api/tba/events/${encodeURIComponent(eventName)}`);
+    } catch (e) {
+      console.warn("TBA fetch failed for event", eventName, e);
+      return;
+    }
+    if (!document.body.contains(table)) return; // user navigated away
+    const byFile = data.byFile || {};
+    if (Object.keys(byFile).length === 0) return; // nothing to add
+    const headerRow = table.querySelector("thead tr");
+    if (headerRow) {
+      headerRow.appendChild(el("th", {}, "Score"));
+      headerRow.appendChild(el("th", {}, "Links"));
+    }
+    for (const tr of table.querySelectorAll("tbody tr")) {
+      const file = tr.getAttribute("data-file");
+      const tba = byFile[file];
+      tr.appendChild(tbaScoreCell(tba));
+      tr.appendChild(tbaLinksCell(tba));
+    }
+  }
+
+  async function loadLogTbaAsync(eventName, logName, slot) {
+    let data;
+    try {
+      data = await fetchJson(
+        `${BASE}/api/tba/logs/${encodeURIComponent(eventName)}/${encodeURIComponent(logName)}`);
+    } catch (e) {
+      console.warn("TBA fetch failed for log", eventName, logName, e);
+      return;
+    }
+    if (!document.body.contains(slot)) return; // user navigated away
+    const tba = data.tba;
+    if (!tba) return;
+    const tbaStrip = el("div", { class: "stats-strip" });
+    const scoreText = tba.opponent_score != null
+      ? `${tba.score}–${tba.opponent_score}` : `${tba.score}`;
+    const resultCls = tba.won === true ? "win" : tba.won === false ? "loss" : "";
+    const resultLabel = tba.won === true ? "Win" : tba.won === false ? "Loss" : "—";
+    tbaStrip.appendChild(stat("Score", scoreText));
+    tbaStrip.appendChild(stat("Result", resultLabel,
+      resultCls === "win" ? "good" : resultCls === "loss" ? "critical" : ""));
+    tbaStrip.appendChild(stat("Alliance", tba.alliance || "—"));
+    const linksDiv = el("div", { class: "stat" },
+      el("div", { class: "label" }, "LINKS"));
+    const linksValue = el("div", { class: "value tba-links" });
+    if (tba.match_key) {
+      linksValue.appendChild(el("a", {
+        href: `https://www.thebluealliance.com/match/${tba.match_key}`,
+        target: "_blank", rel: "noopener", title: "View on The Blue Alliance",
+      }, "TBA"));
+    }
+    if (tba.videos && tba.videos.length > 0) {
+      for (const v of tba.videos) {
+        if (linksValue.childNodes.length > 0) linksValue.appendChild(document.createTextNode(" "));
+        const url = v.type === "youtube"
+          ? `https://www.youtube.com/watch?v=${v.key}` : v.key;
+        linksValue.appendChild(el("a", {
+          href: url, target: "_blank", rel: "noopener", title: "Watch match video",
+        }, "YouTube"));
+      }
+    }
+    linksDiv.appendChild(linksValue);
+    tbaStrip.appendChild(linksDiv);
+    slot.replaceWith(tbaStrip);
   }
 
   // --- TBA helpers --------------------------------------------------------
