@@ -271,18 +271,30 @@ public class TbaClient {
   public Optional<TeamMatchResult> getTeamMatchResult(
       int year, String eventCode, String matchType, int matchNumber, int teamNumber,
       Long logFileTimestampMs) {
+    return resolveMatchObject(year, eventCode, matchType, matchNumber, teamNumber, logFileTimestampMs)
+        .flatMap(match -> extractTeamResult(match, teamNumber));
+  }
+
+  /**
+   * Resolves the raw TBA match JSON object for a team's match, including smart
+   * elimination lookup. Returns the full match object (with key, videos, alliances, etc.)
+   * so callers can extract whatever fields they need.
+   */
+  public Optional<JsonObject> resolveMatchObject(
+      int year, String eventCode, String matchType, int matchNumber, int teamNumber,
+      Long logFileTimestampMs) {
 
     // First try direct lookup (works for Qualification, Semifinal, Final, etc.)
     var matchOpt = getMatch(year, eventCode, matchType, matchNumber);
     if (matchOpt.isPresent()) {
-      return extractTeamResult(matchOpt.get(), teamNumber);
+      return matchOpt;
     }
 
     // If match type is generic "Elimination", try smart matching
     if (matchType != null && isGenericElimination(matchType)) {
       logger.debug("Attempting smart elimination match lookup for team {} at {}{}, match #{}",
           teamNumber, year, eventCode, matchNumber);
-      return findEliminationMatch(year, eventCode, matchNumber, teamNumber, logFileTimestampMs);
+      return findEliminationMatchObject(year, eventCode, matchNumber, teamNumber, logFileTimestampMs);
     }
 
     return Optional.empty();
@@ -301,10 +313,9 @@ public class TbaClient {
 
   /**
    * Smart lookup for elimination matches when only "Elimination #N" is known.
-   * Fetches all event matches, filters to elimination matches for the team,
-   * and finds the best match based on match number and timestamp proximity.
+   * Returns the raw TBA match JSON object so callers can extract key, videos, etc.
    */
-  private Optional<TeamMatchResult> findEliminationMatch(
+  private Optional<JsonObject> findEliminationMatchObject(
       int year, String eventCode, int matchNumber, int teamNumber, Long logFileTimestampMs) {
 
     var allMatchesOpt = getEventMatches(year, eventCode);
@@ -344,12 +355,11 @@ public class TbaClient {
         candidateMatches.size(), teamNumber, year, eventCode);
 
     // Try to find by match number first (most reliable if the numbering is consistent)
-    // Match number in logs often corresponds to the overall elimination match sequence
     var byNumber = findMatchByEliminationNumber(candidateMatches, matchNumber);
     if (byNumber.isPresent()) {
       logger.info("Found elimination match by number {} for team {} at {}{}",
           matchNumber, teamNumber, year, eventCode);
-      return extractTeamResult(byNumber.get(), teamNumber);
+      return byNumber;
     }
 
     // Fall back to timestamp matching if available
@@ -358,7 +368,7 @@ public class TbaClient {
       if (byTime.isPresent()) {
         logger.info("Found elimination match by timestamp for team {} at {}{}",
             teamNumber, year, eventCode);
-        return extractTeamResult(byTime.get(), teamNumber);
+        return byTime;
       }
     }
 

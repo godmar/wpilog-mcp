@@ -168,82 +168,109 @@ public class TbaEnrichment {
     logger.debug("Requesting TBA enrichment for {}: year={}, event={}, match={}, team={}",
         logInfo.filename(), year, eventCode, (matchType + " " + matchNumber), teamNumber);
 
-    // Pass log file timestamp as hint for smart elimination match lookup
-    // Prefer timestamp from filename (stable) over file modification time (changes when copied)
+    // Resolve the full TBA match object (handles both direct and smart elimination lookup)
     var logTimestamp = logInfo.getBestTimestamp();
-    var resultOpt =
-        client.getTeamMatchResult(year, eventCode, matchType, matchNumber, teamNumber, logTimestamp);
+    var matchOpt = client.resolveMatchObject(
+        year, eventCode, matchType, matchNumber, teamNumber, logTimestamp);
 
-    if (resultOpt.isEmpty()) {
+    if (matchOpt.isEmpty()) {
       logger.info("No TBA data found for {} (year={}, event={}, type={}, match={}, team={})",
           logInfo.filename(), year, eventCode, matchType, matchNumber, teamNumber);
       return Optional.empty();
     }
 
-    var result = resultOpt.get();
-    logger.debug("Enriched {} with TBA data: alliance={}, won={}", 
-        logInfo.filename(), result.alliance(), result.won());
+    var match = matchOpt.get();
+    var teamKey = "frc" + teamNumber;
+
+    // Find team's alliance in the match
+    String teamAlliance = null;
+    var alliances = match.getAsJsonObject("alliances");
+    if (alliances != null) {
+      for (var alliance : new String[]{"red", "blue"}) {
+        var allianceData = alliances.getAsJsonObject(alliance);
+        if (allianceData == null) continue;
+        var teamKeys = allianceData.getAsJsonArray("team_keys");
+        if (teamKeys == null) continue;
+        for (var t : teamKeys) {
+          if (teamKey.equals(t.getAsString())) {
+            teamAlliance = alliance;
+            break;
+          }
+        }
+        if (teamAlliance != null) break;
+      }
+    }
+
+    if (teamAlliance == null) {
+      logger.debug("Team {} not found in match alliances", teamNumber);
+      return Optional.empty();
+    }
+
+    logger.debug("Enriched {} with TBA data: alliance={}", logInfo.filename(), teamAlliance);
 
     // Get event timezone for formatting times
     var eventTimezone = getEventTimezone(year, eventCode);
 
     var tba = new JsonObject();
     tba.addProperty("team_number", teamNumber);
-    tba.addProperty("alliance", result.alliance());
-    tba.addProperty("score", result.score());
-    if (result.won() != null) {
-      tba.addProperty("won", result.won());
-    }
-    if (result.actualTimeSeconds() != null) {
-      tba.addProperty("actual_time", result.actualTimeSeconds());
-      var formatted = formatMatchTime(result.actualTimeSeconds(), eventTimezone);
-      if (formatted != null) {
-        tba.addProperty("actual_time_local", formatted);
-      }
-    }
-    if (result.scheduledTimeSeconds() != null) {
-      tba.addProperty("scheduled_time", result.scheduledTimeSeconds());
-      var formatted = formatMatchTime(result.scheduledTimeSeconds(), eventTimezone);
-      if (formatted != null) {
-        tba.addProperty("scheduled_time_local", formatted);
-      }
+    tba.addProperty("alliance", teamAlliance);
+
+    // Score
+    var teamAllianceData = alliances.getAsJsonObject(teamAlliance);
+    if (teamAllianceData != null && teamAllianceData.has("score")) {
+      tba.addProperty("score", teamAllianceData.get("score").getAsInt());
     }
 
-    var matchOpt = client.getMatch(year, eventCode, matchType, matchNumber);
-    if (matchOpt.isPresent()) {
-      var match = matchOpt.get();
-      var opponentAlliance = "red".equals(result.alliance()) ? "blue" : "red";
-      var alliances = match.getAsJsonObject("alliances");
-      if (alliances != null) {
-        var opponent = alliances.getAsJsonObject(opponentAlliance);
-        if (opponent != null && opponent.has("score")) {
-          tba.addProperty("opponent_score", opponent.get("score").getAsInt());
+    // Win/loss
+    var winningAlliance = match.has("winning_alliance")
+        ? match.get("winning_alliance").getAsString() : null;
+    if (winningAlliance != null && !winningAlliance.isEmpty()) {
+      tba.addProperty("won", teamAlliance.equals(winningAlliance));
+    }
+
+    // Opponent score
+    var opponentAlliance = "red".equals(teamAlliance) ? "blue" : "red";
+    var opponentData = alliances.getAsJsonObject(opponentAlliance);
+    if (opponentData != null && opponentData.has("score")) {
+      tba.addProperty("opponent_score", opponentData.get("score").getAsInt());
+    }
+
+    // Timestamps
+    if (match.has("actual_time") && !match.get("actual_time").isJsonNull()) {
+      long actualTime = match.get("actual_time").getAsLong();
+      tba.addProperty("actual_time", actualTime);
+      var formatted = formatMatchTime(actualTime, eventTimezone);
+      if (formatted != null) tba.addProperty("actual_time_local", formatted);
+    }
+    if (match.has("time") && !match.get("time").isJsonNull()) {
+      long scheduledTime = match.get("time").getAsLong();
+      tba.addProperty("scheduled_time", scheduledTime);
+      var formatted = formatMatchTime(scheduledTime, eventTimezone);
+      if (formatted != null) tba.addProperty("scheduled_time_local", formatted);
+    }
+
+    // TBA match key for linking to the match page
+    if (match.has("key") && !match.get("key").isJsonNull()) {
+      tba.addProperty("match_key", match.get("key").getAsString());
+    }
+
+    // Video links (typically YouTube streams)
+    if (match.has("videos") && match.get("videos").isJsonArray()) {
+      var videos = new JsonArray();
+      for (var videoEl : match.getAsJsonArray("videos")) {
+        if (!videoEl.isJsonObject()) continue;
+        var video = videoEl.getAsJsonObject();
+        var type = video.has("type") ? video.get("type").getAsString() : "";
+        var key = video.has("key") ? video.get("key").getAsString() : "";
+        if (!key.isEmpty()) {
+          var v = new JsonObject();
+          v.addProperty("type", type);
+          v.addProperty("key", key);
+          videos.add(v);
         }
       }
-
-      // Include TBA match key for linking to the match page
-      if (match.has("key") && !match.get("key").isJsonNull()) {
-        tba.addProperty("match_key", match.get("key").getAsString());
-      }
-
-      // Include video links (typically YouTube streams)
-      if (match.has("videos") && match.get("videos").isJsonArray()) {
-        var videos = new JsonArray();
-        for (var videoEl : match.getAsJsonArray("videos")) {
-          if (!videoEl.isJsonObject()) continue;
-          var video = videoEl.getAsJsonObject();
-          var type = video.has("type") ? video.get("type").getAsString() : "";
-          var key = video.has("key") ? video.get("key").getAsString() : "";
-          if (!key.isEmpty()) {
-            var v = new JsonObject();
-            v.addProperty("type", type);
-            v.addProperty("key", key);
-            videos.add(v);
-          }
-        }
-        if (videos.size() > 0) {
-          tba.add("videos", videos);
-        }
+      if (videos.size() > 0) {
+        tba.add("videos", videos);
       }
     }
 

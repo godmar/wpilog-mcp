@@ -429,10 +429,37 @@
               order: 1,
             });
           }
+          const totalOpts = timeSeriesOptions("Current (A)", phases);
+          // Add current threshold reference lines
+          if (!totalOpts.plugins.annotation) totalOpts.plugins.annotation = { annotations: {} };
+          const thresholdLines = [
+            { key: "line120", value: 120, label: "120A", color: "rgba(74, 222, 128, 0.7)" },
+            { key: "line160", value: 160, label: "160A", color: "rgba(239, 68, 68, 0.7)" },
+            { key: "line200", value: 200, label: "200A", color: "rgba(168, 85, 247, 0.7)" },
+          ];
+          for (const tl of thresholdLines) {
+            totalOpts.plugins.annotation.annotations[tl.key] = {
+              type: "line",
+              yMin: tl.value,
+              yMax: tl.value,
+              borderColor: tl.color,
+              borderWidth: 1.5,
+              borderDash: [6, 4],
+              label: {
+                display: true,
+                content: tl.label,
+                position: "end",
+                backgroundColor: tl.color,
+                color: "#fff",
+                font: { size: 10, weight: "bold" },
+                padding: 3,
+              },
+            };
+          }
           activeCharts.push(new Chart(totalCanvas, {
             type: "line",
             data: { datasets },
-            options: timeSeriesOptions("Current (A)", phases),
+            options: totalOpts,
           }));
         }
       }
