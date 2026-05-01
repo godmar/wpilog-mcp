@@ -30,6 +30,9 @@ public class BatteryAnalyzer {
   public static final double WARNING_V = 9.0;
 
   private static final int TIME_SERIES_MAX_POINTS = 1500;
+  // 1 s window matches the smoothing on the total-current chart so the two
+  // overlays read at the same time scale.
+  private static final double SMOOTHING_WINDOW_SECONDS = 1.0;
 
   private static final List<String> VOLTAGE_ENTRY_PATTERNS = List.of(
       "robotcontroller/batteryvoltage",
@@ -61,7 +64,85 @@ public class BatteryAnalyzer {
     if (values == null || values.isEmpty()) return BatteryDetail.empty();
     var summary = computeSummary(entry, values);
     var series = downsample(values, TIME_SERIES_MAX_POINTS);
-    return new BatteryDetail(summary, series);
+    var smoothedSeries = smoothedSeries(values);
+    return new BatteryDetail(summary, series, smoothedSeries);
+  }
+
+  /**
+   * Computes a 1 s time-weighted trailing mean of the voltage series and
+   * downsamples it for transport. Uses zero-order-hold semantics, the same
+   * as {@code CurrentAnalyzer.rollingMeanByTime} — duplicated here to keep
+   * the two analyzers self-contained.
+   */
+  private static JsonArray smoothedSeries(List<TimestampedValue> values) {
+    int n = values.size();
+    if (n == 0) return new JsonArray();
+
+    // Materialize as parallel (t, v) arrays, dropping any non-finite values.
+    var ts = new java.util.ArrayList<Double>(n);
+    var vs = new java.util.ArrayList<Double>(n);
+    for (var tv : values) {
+      Double v = toDouble(tv.value());
+      if (v == null || !Double.isFinite(v)) continue;
+      ts.add(tv.timestamp());
+      vs.add(v);
+    }
+    int m = ts.size();
+    if (m == 0) return new JsonArray();
+
+    // integral[k] = ∫_{t_0}^{t_k} value(u) du under ZOH interpretation.
+    double[] integral = new double[m];
+    for (int k = 1; k < m; k++) {
+      integral[k] = integral[k - 1] + vs.get(k - 1) * (ts.get(k) - ts.get(k - 1));
+    }
+    double t0 = ts.get(0);
+
+    var smoothed = new java.util.ArrayList<double[]>(m);
+    int cursor = 0;
+    for (int i = 0; i < m; i++) {
+      double ti = ts.get(i);
+      double windowStart = Math.max(t0, ti - SMOOTHING_WINDOW_SECONDS);
+      while (cursor + 1 < m && ts.get(cursor + 1) <= windowStart) cursor++;
+      double integralAtWindowStart = integral[cursor]
+          + vs.get(cursor) * (windowStart - ts.get(cursor));
+      double integralAtTi = integral[i];
+      double duration = ti - windowStart;
+      double mean = duration > 0
+          ? (integralAtTi - integralAtWindowStart) / duration
+          : vs.get(i);
+      smoothed.add(new double[]{ti, mean});
+    }
+
+    // Reuse the same min/max-preserving downsampler shape.
+    var out = new JsonArray();
+    if (smoothed.size() <= TIME_SERIES_MAX_POINTS) {
+      for (var s : smoothed) out.add(point(s[0], s[1]));
+      return out;
+    }
+    int buckets = Math.max(1, TIME_SERIES_MAX_POINTS / 2);
+    double bucketSize = (double) smoothed.size() / buckets;
+    for (int b = 0; b < buckets; b++) {
+      int start = (int) Math.floor(b * bucketSize);
+      int end = (int) Math.floor((b + 1) * bucketSize);
+      if (end <= start) end = start + 1;
+      if (end > smoothed.size()) end = smoothed.size();
+      double minV = Double.POSITIVE_INFINITY;
+      double maxV = Double.NEGATIVE_INFINITY;
+      double tMin = 0, tMax = 0;
+      for (int i = start; i < end; i++) {
+        var s = smoothed.get(i);
+        if (s[1] < minV) { minV = s[1]; tMin = s[0]; }
+        if (s[1] > maxV) { maxV = s[1]; tMax = s[0]; }
+      }
+      if (tMin <= tMax) {
+        out.add(point(tMin, minV));
+        if (tMin != tMax || minV != maxV) out.add(point(tMax, maxV));
+      } else {
+        out.add(point(tMax, maxV));
+        out.add(point(tMin, minV));
+      }
+    }
+    return out;
   }
 
   // ======================================================================
@@ -230,14 +311,17 @@ public class BatteryAnalyzer {
     }
   }
 
-  public record BatteryDetail(BatterySummary summary, JsonArray series) {
+  public record BatteryDetail(BatterySummary summary, JsonArray series, JsonArray smoothedSeries) {
     public static BatteryDetail empty() {
-      return new BatteryDetail(BatterySummary.empty(), new JsonArray());
+      return new BatteryDetail(BatterySummary.empty(), new JsonArray(), new JsonArray());
     }
 
     public JsonObject toJson() {
       var o = summary.toJson();
       o.add("series", series);
+      if (smoothedSeries != null && smoothedSeries.size() > 0) {
+        o.add("smoothedSeries", smoothedSeries);
+      }
       return o;
     }
   }

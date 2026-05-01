@@ -355,28 +355,44 @@
         const canvas = el("canvas");
         box.appendChild(canvas);
         appEl.appendChild(box);
+        const hasBattSmoothed = battery.smoothedSeries && battery.smoothedSeries.length > 0;
+        const battDatasets = [{
+          label: hasBattSmoothed ? "Battery voltage (raw)" : "Battery voltage (V)",
+          data: battery.series.map(([t, v]) => ({ x: t, y: v })),
+          borderColor: hasBattSmoothed ? "rgba(96, 165, 250, 0.45)" : "#60a5fa",
+          backgroundColor: "transparent",
+          borderWidth: 1,
+          pointRadius: 0,
+          tension: 0,
+          order: 2,
+        }];
+        if (hasBattSmoothed) {
+          battDatasets.push({
+            label: "1 s trailing mean",
+            data: battery.smoothedSeries.map(([t, v]) => ({ x: t, y: v })),
+            borderColor: "#60a5fa",
+            backgroundColor: "transparent",
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0,
+            order: 1,
+          });
+        }
+        battDatasets.push({
+          label: "Brownout (6.8 V)",
+          data: [
+            { x: battery.series[0][0], y: 6.8 },
+            { x: battery.series[battery.series.length - 1][0], y: 6.8 }
+          ],
+          borderColor: "#ef4444",
+          borderDash: [6, 4],
+          borderWidth: 1,
+          pointRadius: 0,
+          order: 0,
+        });
         activeCharts.push(new Chart(canvas, {
           type: "line",
-          data: {
-            datasets: [{
-              label: "Battery voltage (V)",
-              data: battery.series.map(([t, v]) => ({ x: t, y: v })),
-              borderColor: "#60a5fa",
-              borderWidth: 1.3,
-              pointRadius: 0,
-              tension: 0,
-            }, {
-              label: "Brownout (6.8 V)",
-              data: [
-                { x: battery.series[0][0], y: 6.8 },
-                { x: battery.series[battery.series.length - 1][0], y: 6.8 }
-              ],
-              borderColor: "#ef4444",
-              borderDash: [6, 4],
-              borderWidth: 1,
-              pointRadius: 0,
-            }],
-          },
+          data: { datasets: battDatasets },
           options: timeSeriesOptions("Voltage (V)", phases),
         }));
       }
