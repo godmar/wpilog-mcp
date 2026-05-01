@@ -86,11 +86,12 @@ public class CurrentAnalyzer {
       var inMatch = filterToMatch(samples, phases);
       var stats = stats(inMatch);
       JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
+      JsonArray smoothedSeries = includeSeries ? smoothedSeries(samples) : null;
       subsystems.add(new Subsystem(
           "Swerve " + module.label(),
           module.prefix() + "/(computed)",
           "swerve",
-          stats, series));
+          stats, series, smoothedSeries));
       matchSampleLists.add(inMatch);
     }
 
@@ -112,11 +113,12 @@ public class CurrentAnalyzer {
       var inMatch = filterToMatch(samples, phases);
       var stats = stats(inMatch);
       JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
+      JsonArray smoothedSeries = includeSeries ? smoothedSeries(samples) : null;
       subsystems.add(new Subsystem(
           friendlyName(name),
           name,
           "direct",
-          stats, series));
+          stats, series, smoothedSeries));
       matchSampleLists.add(inMatch);
     }
 
@@ -149,6 +151,18 @@ public class CurrentAnalyzer {
         totalStats.mean(), totalStats.peak(), totalStats.p90(),
         Collections.unmodifiableList(subsystems), totalSeries, totalSmoothedSeries);
     return new CurrentDetail(summary);
+  }
+
+  /**
+   * Computes a 1 s time-weighted trailing mean of {@code samples} and downsamples
+   * it for transport. Returns {@code null} if the input is empty so callers can
+   * skip the JSON field entirely.
+   */
+  private static JsonArray smoothedSeries(List<Sample> samples) {
+    if (samples.isEmpty()) return null;
+    var smoothed = rollingMeanByTime(samples, TOTAL_SMOOTHING_WINDOW_SECONDS);
+    if (smoothed.isEmpty()) return null;
+    return downsampleSamples(smoothed, TIME_SERIES_MAX_POINTS);
   }
 
   /**
@@ -619,13 +633,16 @@ public class CurrentAnalyzer {
     final String source; // "direct" or "swerve"
     final Stats stats;
     final JsonArray series; // nullable
+    final JsonArray smoothedSeries; // nullable — 1 s trailing mean overlay
 
-    Subsystem(String name, String entry, String source, Stats stats, JsonArray series) {
+    Subsystem(String name, String entry, String source, Stats stats,
+              JsonArray series, JsonArray smoothedSeries) {
       this.name = name;
       this.entry = entry;
       this.source = source;
       this.stats = stats;
       this.series = series;
+      this.smoothedSeries = smoothedSeries;
     }
 
     JsonObject toJson() {
@@ -635,6 +652,7 @@ public class CurrentAnalyzer {
       o.addProperty("source", source);
       o.add("stats", stats.toJson());
       if (series != null) o.add("series", series);
+      if (smoothedSeries != null) o.add("smoothedSeries", smoothedSeries);
       return o;
     }
   }

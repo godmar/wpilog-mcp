@@ -545,15 +545,37 @@
     const canvas = el("canvas");
     box.appendChild(canvas);
     appEl.appendChild(box);
-    const datasets = withSeries.map((s, i) => ({
-      label: s.name,
-      data: s.series.map(([t, v]) => ({ x: t, y: v })),
-      borderColor: TIME_SERIES_COLORS[i % TIME_SERIES_COLORS.length],
-      backgroundColor: "transparent",
-      borderWidth: 1,
-      pointRadius: 0,
-      tension: 0,
-    }));
+    // For each subsystem render two overlaid datasets (same color):
+    //   - raw — thin and faint (no legend entry, hidden from tooltip)
+    //   - 1 s trailing mean — thicker, drawn on top, owns the legend label
+    const datasets = [];
+    withSeries.forEach((s, i) => {
+      const color = TIME_SERIES_COLORS[i % TIME_SERIES_COLORS.length];
+      const hasSmoothed = s.smoothedSeries && s.smoothedSeries.length > 0;
+      datasets.push({
+        label: hasSmoothed ? `${s.name} (raw)` : s.name,
+        data: s.series.map(([t, v]) => ({ x: t, y: v })),
+        borderColor: hasSmoothed ? color + "55" : color,
+        backgroundColor: "transparent",
+        borderWidth: 1,
+        pointRadius: 0,
+        tension: 0,
+        order: 2,
+        hidden: hasSmoothed,
+      });
+      if (hasSmoothed) {
+        datasets.push({
+          label: s.name,
+          data: s.smoothedSeries.map(([t, v]) => ({ x: t, y: v })),
+          borderColor: color,
+          backgroundColor: "transparent",
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0,
+          order: 1,
+        });
+      }
+    });
     activeCharts.push(new Chart(canvas, {
       type: "line",
       data: { datasets },
