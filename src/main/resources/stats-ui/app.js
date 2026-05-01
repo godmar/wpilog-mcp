@@ -41,9 +41,14 @@
   const logsRootEl = document.getElementById("logs-root");
 
   let activeCharts = [];
+  // Subset of activeCharts whose x-axis is log time (seconds). The YouTube
+  // playhead overlay updates these in lockstep with video playback.
+  let timeSeriesCharts = [];
   function destroyCharts() {
     for (const c of activeCharts) c.destroy();
     activeCharts = [];
+    timeSeriesCharts = [];
+    teardownYouTubePanel();
   }
 
   // --- Utilities ---------------------------------------------------------
@@ -288,9 +293,10 @@
       // TBA match info strip is loaded asynchronously by loadLogTbaAsync below
       // so a slow Blue Alliance API never blocks the initial render. We reserve
       // a placeholder slot here so the strip lands in the right DOM position.
+      // Pass phases so the YouTube playhead can map video time → log time.
       const tbaSlot = el("div", { id: "tba-slot" });
       appEl.appendChild(tbaSlot);
-      loadLogTbaAsync(eventName, logName, tbaSlot);
+      loadLogTbaAsync(eventName, logName, tbaSlot, phases);
 
       const battery = data.battery || {};
       const current = data.current || {};
@@ -355,11 +361,13 @@
           pointRadius: 0,
           order: 0,
         });
-        activeCharts.push(new Chart(canvas, {
+        const battChart = new Chart(canvas, {
           type: "line",
           data: { datasets: battDatasets },
           options: timeSeriesOptions("Voltage (V)", phases),
-        }));
+        });
+        activeCharts.push(battChart);
+        timeSeriesCharts.push(battChart);
       }
 
       // Aligned total current over time. This is the single series whose
@@ -437,11 +445,13 @@
               },
             };
           }
-          activeCharts.push(new Chart(totalCanvas, {
+          const totalChart = new Chart(totalCanvas, {
             type: "line",
             data: { datasets },
             options: totalOpts,
-          }));
+          });
+          activeCharts.push(totalChart);
+          timeSeriesCharts.push(totalChart);
         }
       }
 
@@ -612,11 +622,13 @@
         });
       }
     });
-    activeCharts.push(new Chart(canvas, {
+    const subChart = new Chart(canvas, {
       type: "line",
       data: { datasets },
       options: timeSeriesOptions("Current (A)", phases),
-    }));
+    });
+    activeCharts.push(subChart);
+    timeSeriesCharts.push(subChart);
   }
 
   // Builds Chart.js annotation plugin config from a match-phases object.
@@ -742,7 +754,7 @@
     }
   }
 
-  async function loadLogTbaAsync(eventName, logName, slot) {
+  async function loadLogTbaAsync(eventName, logName, slot, phases) {
     let data;
     try {
       data = await fetchJson(
@@ -785,6 +797,171 @@
     linksDiv.appendChild(linksValue);
     tbaStrip.appendChild(linksDiv);
     slot.replaceWith(tbaStrip);
+
+    // If TBA gave us a YouTube replay, pop up the movable player and start
+    // syncing the playhead to all time-series charts.
+    const ytVideo = (tba.videos || []).find(v => v.type === "youtube" && v.key);
+    if (ytVideo && phases && phases.matchStart != null) {
+      setupYouTubePanel(ytVideo.key, phases.matchStart);
+    }
+  }
+
+  // --- YouTube replay overlay --------------------------------------------
+  // A draggable floating panel that embeds the TBA-provided YouTube replay
+  // and draws a vertical "playhead" annotation on every time-series chart.
+  // The user adjusts a slider to set how many seconds into the video the
+  // match's matchStart event lands (default 5 s); then for any video time
+  // T_yt, the corresponding log time is matchStart + (T_yt − offset).
+
+  let ytPanel = null;
+  let ytPlayer = null;
+  let ytPollTimer = null;
+  let ytApiPromise = null;
+
+  function loadYouTubeIframeAPI() {
+    if (window.YT && window.YT.Player) return Promise.resolve();
+    if (ytApiPromise) return ytApiPromise;
+    ytApiPromise = new Promise((resolve) => {
+      const tag = document.createElement("script");
+      tag.src = "https://www.youtube.com/iframe_api";
+      document.head.appendChild(tag);
+      const prev = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = function () {
+        if (typeof prev === "function") prev();
+        resolve();
+      };
+    });
+    return ytApiPromise;
+  }
+
+  function teardownYouTubePanel() {
+    if (ytPollTimer != null) {
+      clearInterval(ytPollTimer);
+      ytPollTimer = null;
+    }
+    if (ytPlayer && typeof ytPlayer.destroy === "function") {
+      try { ytPlayer.destroy(); } catch (e) { /* ignore */ }
+    }
+    ytPlayer = null;
+    if (ytPanel && ytPanel.parentNode) ytPanel.parentNode.removeChild(ytPanel);
+    ytPanel = null;
+  }
+
+  function setupYouTubePanel(videoKey, matchStart) {
+    teardownYouTubePanel();
+
+    let offset = 5.0; // seconds into the video where matchStart lands
+
+    const panel = el("div", { class: "yt-panel", id: "yt-panel" });
+    const header = el("div", { class: "yt-panel-header" },
+      el("span", { class: "yt-title" }, "Match replay"),
+      el("button", { class: "yt-close", title: "Close player" }, "×"),
+    );
+    const iframeMount = el("div", { class: "yt-iframe-mount" },
+      el("div", { id: "yt-player" }),
+    );
+    const offsetDisplay = el("span", { class: "yt-offset-display" }, offset.toFixed(1));
+    const slider = el("input", {
+      type: "range", min: "-30", max: "180", step: "0.1",
+      value: String(offset), class: "yt-offset-slider",
+    });
+    const controls = el("div", { class: "yt-controls" },
+      el("label", { class: "yt-offset-label" },
+        "Match starts at video t = ", offsetDisplay, " s"),
+      slider,
+      el("p", { class: "yt-hint" },
+        "Drag the header to move. Adjust the slider to align video time with match start."),
+    );
+    panel.appendChild(header);
+    panel.appendChild(iframeMount);
+    panel.appendChild(controls);
+    document.body.appendChild(panel);
+    ytPanel = panel;
+
+    makeDraggable(panel, header);
+    header.querySelector(".yt-close").addEventListener("click", teardownYouTubePanel);
+
+    function applyPlayhead(ytTime) {
+      if (!Number.isFinite(ytTime)) return;
+      const logTime = matchStart + (ytTime - offset);
+      for (const c of timeSeriesCharts) {
+        if (!c || !c.options) continue;
+        const plugins = c.options.plugins || (c.options.plugins = {});
+        const ann = plugins.annotation || (plugins.annotation = { annotations: {} });
+        const annotations = ann.annotations || (ann.annotations = {});
+        annotations.ytPlayhead = {
+          type: "line",
+          xMin: logTime,
+          xMax: logTime,
+          borderColor: "#ec4899",
+          borderWidth: 2,
+          label: {
+            display: true,
+            content: "▶",
+            position: "start",
+            backgroundColor: "#ec4899",
+            color: "#fff",
+            font: { size: 10, weight: "bold" },
+            padding: 3,
+          },
+        };
+        c.update("none");
+      }
+    }
+
+    slider.addEventListener("input", (e) => {
+      offset = parseFloat(e.target.value);
+      offsetDisplay.textContent = offset.toFixed(1);
+      if (ytPlayer && typeof ytPlayer.getCurrentTime === "function") {
+        applyPlayhead(ytPlayer.getCurrentTime());
+      }
+    });
+
+    loadYouTubeIframeAPI().then(() => {
+      if (!document.body.contains(panel)) return;
+      ytPlayer = new window.YT.Player("yt-player", {
+        height: "200", width: "356",
+        videoId: videoKey,
+        playerVars: { playsinline: 1, rel: 0, modestbranding: 1 },
+        events: {
+          onReady: () => {
+            ytPollTimer = setInterval(() => {
+              if (!ytPlayer || typeof ytPlayer.getCurrentTime !== "function") return;
+              applyPlayhead(ytPlayer.getCurrentTime());
+            }, 150);
+          },
+        },
+      });
+    });
+  }
+
+  // Generic header-drag for the YouTube panel.
+  function makeDraggable(panel, handle) {
+    let dragging = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+    handle.style.cursor = "move";
+    handle.addEventListener("mousedown", (e) => {
+      // Don't start a drag from the close button.
+      if (e.target.closest(".yt-close")) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      // Switch from any right-anchored positioning to absolute left/top.
+      panel.style.left = rect.left + "px";
+      panel.style.top = rect.top + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      startX = e.clientX;
+      startY = e.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      panel.style.left = (startLeft + e.clientX - startX) + "px";
+      panel.style.top = (startTop + e.clientY - startY) + "px";
+    });
+    document.addEventListener("mouseup", () => { dragging = false; });
   }
 
   // --- TBA helpers --------------------------------------------------------
