@@ -111,9 +111,23 @@ public class TbaEnrichment {
     return LocalDate.now().getYear();
   }
 
+  // FMS reports the long division name (e.g. "Hopper"); TBA uses 3-letter
+  // event codes (e.g. "hop"). Map the known FRC championship divisions so
+  // enrichment finds the right TBA event.
+  private static final java.util.Map<String, String> DIVISION_ALIASES = java.util.Map.ofEntries(
+      java.util.Map.entry("archimedes", "arc"),
+      java.util.Map.entry("curie", "cur"),
+      java.util.Map.entry("daly", "dal"),
+      java.util.Map.entry("galileo", "gal"),
+      java.util.Map.entry("hopper", "hop"),
+      java.util.Map.entry("johnson", "joh"),
+      java.util.Map.entry("milstein", "mil"),
+      java.util.Map.entry("newton", "new"));
+
   private String normalizeEventCode(String eventCode) {
     if (eventCode == null) return null;
-    return eventCode.replaceAll("^\\d{4}", "").toLowerCase();
+    var stripped = eventCode.replaceAll("^\\d{4}", "").toLowerCase();
+    return DIVISION_ALIASES.getOrDefault(stripped, stripped);
   }
 
   /**
