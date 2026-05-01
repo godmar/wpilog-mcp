@@ -920,7 +920,7 @@
     loadYouTubeIframeAPI().then(() => {
       if (!document.body.contains(panel)) return;
       ytPlayer = new window.YT.Player("yt-player", {
-        height: "200", width: "356",
+        height: "100%", width: "100%",
         videoId: videoKey,
         playerVars: { playsinline: 1, rel: 0, modestbranding: 1 },
         events: {

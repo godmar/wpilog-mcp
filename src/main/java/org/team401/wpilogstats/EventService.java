@@ -10,6 +10,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,6 +30,8 @@ import org.triplehelix.wpilogmcp.tba.TbaEnrichment;
 public class EventService {
   private static final Logger logger = LoggerFactory.getLogger(EventService.class);
   private static final int MAX_LOGS_PER_EVENT = 500;
+  private static final int MAX_EVENT_SUMMARY_CACHE_ENTRIES = 32;
+  private static final int MAX_LOG_DETAIL_CACHE_ENTRIES = 128;
 
   /**
    * Returns true for logs that should be excluded from the stats UI. Sim logs
@@ -44,6 +47,10 @@ public class EventService {
   private final BatteryAnalyzer batteryAnalyzer = new BatteryAnalyzer();
   private final CurrentAnalyzer currentAnalyzer = new CurrentAnalyzer();
   private final VisionAnalyzer visionAnalyzer = new VisionAnalyzer();
+  private final Map<String, CachedJson<EventFingerprint>> eventSummaryCache =
+      new ConcurrentHashMap<>();
+  private final Map<String, CachedJson<LogFingerprint>> logDetailCache =
+      new ConcurrentHashMap<>();
 
   public EventService(Path logsRoot) {
     this.logsRoot = logsRoot.toAbsolutePath().normalize();
@@ -109,6 +116,21 @@ public class EventService {
       throw new IllegalArgumentException("No .wpilog files under event: " + eventName);
     }
 
+    var fingerprint = eventFingerprint(logFiles);
+    var cached = eventSummaryCache.get(eventName);
+    if (cached != null && cached.fingerprint().equals(fingerprint)) {
+      logger.debug("Event summary cache hit for {}", eventName);
+      return cached.json().deepCopy();
+    }
+
+    logger.debug("Event summary cache miss for {}", eventName);
+    var summary = buildEventSummary(eventName, logFiles);
+    putCacheEntry(eventSummaryCache, eventName, new CachedJson<>(fingerprint, summary),
+        MAX_EVENT_SUMMARY_CACHE_ENTRIES);
+    return summary.deepCopy();
+  }
+
+  private JsonObject buildEventSummary(String eventName, List<Path> logFiles) {
     var summary = new JsonObject();
     summary.addProperty("event", eventName);
     summary.addProperty("logCount", logFiles.size());
@@ -176,6 +198,22 @@ public class EventService {
       throw new IllegalArgumentException("Log excluded: " + logName);
     }
 
+    var fingerprint = logFingerprint(logPath);
+    String cacheKey = logPath.toString();
+    var cached = logDetailCache.get(cacheKey);
+    if (cached != null && cached.fingerprint().equals(fingerprint)) {
+      logger.debug("Log detail cache hit for {}", logPath);
+      return cached.json().deepCopy();
+    }
+
+    logger.debug("Log detail cache miss for {}", logPath);
+    var result = buildLogDetail(eventName, logPath);
+    putCacheEntry(logDetailCache, cacheKey, new CachedJson<>(fingerprint, result),
+        MAX_LOG_DETAIL_CACHE_ENTRIES);
+    return result.deepCopy();
+  }
+
+  private JsonObject buildLogDetail(String eventName, Path logPath) throws IOException {
     LogData log;
     try {
       log = LogManager.getInstance().loadLog(logPath.toString());
@@ -284,6 +322,35 @@ public class EventService {
   // ======================================================================
   // Helpers
   // ======================================================================
+
+  private record CachedJson<T>(T fingerprint, JsonObject json) {}
+
+  private record EventFingerprint(List<LogFingerprint> logs) {}
+
+  private record LogFingerprint(String relativeName, long size, long lastModifiedMillis) {}
+
+  private EventFingerprint eventFingerprint(List<Path> logFiles) throws IOException {
+    var stamps = new ArrayList<LogFingerprint>(logFiles.size());
+    for (var path : logFiles) {
+      stamps.add(logFingerprint(path));
+    }
+    return new EventFingerprint(List.copyOf(stamps));
+  }
+
+  private LogFingerprint logFingerprint(Path logPath) throws IOException {
+    return new LogFingerprint(
+        relativeName(logPath),
+        Files.size(logPath),
+        Files.getLastModifiedTime(logPath).toMillis());
+  }
+
+  private static <T> void putCacheEntry(
+      Map<String, CachedJson<T>> cache, String key, CachedJson<T> value, int maxEntries) {
+    if (cache.size() >= maxEntries && !cache.containsKey(key)) {
+      cache.clear();
+    }
+    cache.put(key, value);
+  }
 
   private Path resolveEvent(String eventName) {
     if (eventName.isEmpty() || eventName.contains("..") || eventName.contains("/")
