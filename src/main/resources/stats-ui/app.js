@@ -330,6 +330,7 @@
 
       const battery = data.battery || {};
       const current = data.current || {};
+      const vision = data.vision || {};
 
       // Battery stats
       const strip = el("div", { class: "stats-strip" });
@@ -542,9 +543,64 @@
       } else {
         appEl.appendChild(el("p", {}, "No current entries detected in this log."));
       }
+
+      renderVisionSection(vision);
     } catch (e) {
       showError(e);
     }
+  }
+
+  // Renders a per-camera vision-quality table from the photonvision-style
+  // {accepted, rejected} pose-array streams summarized by VisionAnalyzer.
+  // Skipped silently when the log doesn't carry RobotPosesAccepted/Rejected
+  // entries (e.g. Limelight-only setups not yet supported here).
+  function renderVisionSection(vision) {
+    if (!vision || !vision.available || !vision.cameras || vision.cameras.length === 0) return;
+    appEl.appendChild(el("h3", {}, "Vision / localization"));
+
+    const strip = el("div", { class: "stats-strip" });
+    strip.appendChild(stat("Accepted poses", fmtInt(vision.totalAcceptedPoses)));
+    strip.appendChild(stat("Rejected poses", fmtInt(vision.totalRejectedPoses)));
+    if (vision.rejectionRate != null) {
+      strip.appendChild(stat("Rejection rate", `${(vision.rejectionRate * 100).toFixed(1)}%`,
+        vision.rejectionRate > 0.5 ? "critical"
+          : vision.rejectionRate > 0.25 ? "warn" : "good"));
+    }
+    appEl.appendChild(strip);
+
+    const table = el("table");
+    const thead = el("thead");
+    thead.appendChild(el("tr", {},
+      el("th", {}, "Camera"),
+      el("th", {}, "Accepted"),
+      el("th", {}, "Rejected"),
+      el("th", {}, "Reject %"),
+      el("th", {}, "Detections (Hz)"),
+      el("th", {}, "Mean dist (m)"),
+      el("th", {}, "Max dist (m)"),
+      el("th", {}, "Worst gap (s)"),
+    ));
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    for (const c of vision.cameras) {
+      const reject = c.rejectionRate != null ? `${(c.rejectionRate * 100).toFixed(1)}%` : "—";
+      const rejectClass = c.rejectionRate != null && c.rejectionRate > 0.5 ? "tba-loss"
+        : c.rejectionRate != null && c.rejectionRate > 0.25 ? "warn"
+        : "";
+      const tr = el("tr", {},
+        el("td", {}, c.name),
+        el("td", { class: "num" }, fmtInt(c.acceptedPoses)),
+        el("td", { class: "num" }, fmtInt(c.rejectedPoses)),
+        el("td", { class: "num " + rejectClass }, reject),
+        el("td", { class: "num" }, c.detectionsHz != null ? c.detectionsHz.toFixed(1) : "—"),
+        el("td", { class: "num" }, c.distanceMean != null ? c.distanceMean.toFixed(2) : "—"),
+        el("td", { class: "num" }, c.distanceMax != null ? c.distanceMax.toFixed(2) : "—"),
+        el("td", { class: "num" }, c.distanceMaxGapSec != null ? c.distanceMaxGapSec.toFixed(1) : "—"),
+      );
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    appEl.appendChild(table);
   }
 
   // Renders a single "current over time" chart for a filtered subset of

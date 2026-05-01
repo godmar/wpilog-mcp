@@ -43,6 +43,7 @@ public class EventService {
   private final Path logsRoot;
   private final BatteryAnalyzer batteryAnalyzer = new BatteryAnalyzer();
   private final CurrentAnalyzer currentAnalyzer = new CurrentAnalyzer();
+  private final VisionAnalyzer visionAnalyzer = new VisionAnalyzer();
 
   public EventService(Path logsRoot) {
     this.logsRoot = logsRoot.toAbsolutePath().normalize();
@@ -203,6 +204,7 @@ public class EventService {
     var phases = MatchPhaseDetector.detect(log);
     result.add("battery", batteryAnalyzer.detail(log).toJson());
     result.add("current", currentAnalyzer.detail(log, phases).toJson());
+    result.add("vision", visionAnalyzer.summarize(log, phases));
     result.add("phases", phasesJson(phases));
 
     // TBA enrichment: match score, result, videos, TBA link

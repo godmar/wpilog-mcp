@@ -505,6 +505,60 @@ public final class FrcDomainTools {
         builder.addProperty("jump_count", poseJumps.size());
       }
 
+      // Photonvision-style detection: scan for *RobotPosesAccepted / *RobotPosesRejected
+      // entries (typed as struct:Pose3d[]). AdvantageKit-with-Photon logs publish
+      // these per camera under /RealOutputs/Vision/<CameraName>/, but the user-facing
+      // input data lives under /Vision/<CameraName>/, so the visionPrefix filter is
+      // applied with contains() rather than startsWith() to handle either path.
+      var perCameraMap = new java.util.LinkedHashMap<String, JsonObject>();
+      for (var entryName : log.entries().keySet()) {
+        var lower = lowerEntryNames.get(entryName);
+        String kind;
+        if (lower.endsWith("/robotposesaccepted")) kind = "accepted";
+        else if (lower.endsWith("/robotposesrejected")) kind = "rejected";
+        else continue;
+        if (visionPrefix != null && !entryName.contains(visionPrefix)) continue;
+
+        int slash = entryName.lastIndexOf('/');
+        if (slash <= 0) continue;
+        String parent = entryName.substring(0, slash);
+        int parentSlash = parent.lastIndexOf('/');
+        String cameraLabel = parent.substring(parentSlash + 1);
+
+        var values = log.values().get(entryName);
+        if (values == null) continue;
+        long updates = 0, nonEmpty = 0, totalPoses = 0;
+        for (var tv : values) {
+          if (!inTimeRange(tv.timestamp(), startTime, endTime)) continue;
+          updates++;
+          if (tv.value() instanceof java.util.List<?> list && !list.isEmpty()) {
+            nonEmpty++;
+            totalPoses += list.size();
+          }
+        }
+
+        var camData = perCameraMap.computeIfAbsent(cameraLabel, k -> {
+          var o = new JsonObject();
+          o.addProperty("camera", k);
+          return o;
+        });
+        camData.addProperty(kind + "_updates", updates);
+        camData.addProperty(kind + "_nonempty_updates", nonEmpty);
+        camData.addProperty(kind + "_poses", totalPoses);
+      }
+
+      if (!perCameraMap.isEmpty()) {
+        var perCamera = new com.google.gson.JsonArray();
+        for (var camData : perCameraMap.values()) {
+          long acc = camData.has("accepted_poses") ? camData.get("accepted_poses").getAsLong() : 0;
+          long rej = camData.has("rejected_poses") ? camData.get("rejected_poses").getAsLong() : 0;
+          long total = acc + rej;
+          if (total > 0) camData.addProperty("rejection_rate", (double) rej / total);
+          perCamera.add(camData);
+        }
+        builder.addData("per_camera", perCamera);
+      }
+
       // Data quality from first target entry, or first pose entry as fallback
       List<TimestampedValue> qualitySource = null;
       if (!targetValidEntries.isEmpty()) {
