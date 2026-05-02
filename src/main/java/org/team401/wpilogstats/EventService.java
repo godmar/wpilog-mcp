@@ -47,6 +47,7 @@ public class EventService {
   private final BatteryAnalyzer batteryAnalyzer = new BatteryAnalyzer();
   private final CurrentAnalyzer currentAnalyzer = new CurrentAnalyzer();
   private final VisionAnalyzer visionAnalyzer = new VisionAnalyzer();
+  private final LoopTimingAnalyzer loopTimingAnalyzer = new LoopTimingAnalyzer();
   private final Map<String, CachedJson<EventFingerprint>> eventSummaryCache =
       new ConcurrentHashMap<>();
   private final Map<String, CachedJson<LogFingerprint>> logDetailCache =
@@ -181,22 +182,13 @@ public class EventService {
   // Per-log detail (time series + stats)
   // ======================================================================
 
+  public String logDetailEtag(String eventName, String logName) throws IOException {
+    Path logPath = resolveLogPath(eventName, logName, true);
+    return logFingerprint(logPath).etag();
+  }
+
   public JsonObject detailLog(String eventName, String logName) throws IOException {
-    Path eventDir = resolveEvent(eventName);
-    Path logPath = eventDir.resolve(logName).toAbsolutePath().normalize();
-    if (!logPath.startsWith(eventDir)) {
-      throw new IllegalArgumentException("Log path escapes event directory: " + logName);
-    }
-    if (!Files.isRegularFile(logPath)) {
-      // Fall back to a depth-walk in case the caller passed a nested name.
-      logPath = findNested(eventDir, logName);
-      if (logPath == null) {
-        throw new IllegalArgumentException("Log not found: " + eventName + "/" + logName);
-      }
-    }
-    if (isExcluded(logPath)) {
-      throw new IllegalArgumentException("Log excluded: " + logName);
-    }
+    Path logPath = resolveLogPath(eventName, logName, true);
 
     var fingerprint = logFingerprint(logPath);
     String cacheKey = logPath.toString();
@@ -232,6 +224,7 @@ public class EventService {
 
     var phases = MatchPhaseDetector.detect(log);
     result.add("battery", batteryAnalyzer.detail(log).toJson());
+    result.add("loopTiming", loopTimingAnalyzer.detail(log).toJson());
     result.add("current", currentAnalyzer.detail(log, phases).toJson());
     result.add("vision", visionAnalyzer.summarize(log, phases));
     result.add("phases", phasesJson(phases));
@@ -278,17 +271,7 @@ public class EventService {
    * TBA data for a single log, or an empty {@code tba} key when none is available.
    */
   public JsonObject tbaForLog(String eventName, String logName) throws IOException {
-    Path eventDir = resolveEvent(eventName);
-    Path logPath = eventDir.resolve(logName).toAbsolutePath().normalize();
-    if (!logPath.startsWith(eventDir)) {
-      throw new IllegalArgumentException("Log path escapes event directory: " + logName);
-    }
-    if (!Files.isRegularFile(logPath)) {
-      logPath = findNested(eventDir, logName);
-      if (logPath == null) {
-        throw new IllegalArgumentException("Log not found: " + eventName + "/" + logName);
-      }
-    }
+    Path logPath = resolveLogPath(eventName, logName, false);
 
     var result = new JsonObject();
     result.addProperty("event", eventName);
@@ -327,7 +310,17 @@ public class EventService {
 
   private record EventFingerprint(List<LogFingerprint> logs) {}
 
-  private record LogFingerprint(String relativeName, long size, long lastModifiedMillis) {}
+  private record LogFingerprint(String relativeName, long size, long lastModifiedMillis) {
+    String etag() {
+      return "\"log-v4-"
+          + Integer.toUnsignedString(relativeName.hashCode(), 16)
+          + "-"
+          + Long.toHexString(size)
+          + "-"
+          + Long.toHexString(lastModifiedMillis)
+          + "\"";
+    }
+  }
 
   private EventFingerprint eventFingerprint(List<Path> logFiles) throws IOException {
     var stamps = new ArrayList<LogFingerprint>(logFiles.size());
@@ -365,6 +358,26 @@ public class EventService {
       throw new IllegalArgumentException("Event directory not found: " + eventName);
     }
     return eventDir;
+  }
+
+  private Path resolveLogPath(String eventName, String logName, boolean rejectExcluded)
+      throws IOException {
+    Path eventDir = resolveEvent(eventName);
+    Path logPath = eventDir.resolve(logName).toAbsolutePath().normalize();
+    if (!logPath.startsWith(eventDir)) {
+      throw new IllegalArgumentException("Log path escapes event directory: " + logName);
+    }
+    if (!Files.isRegularFile(logPath)) {
+      // Fall back to a depth-walk in case the caller passed a nested name.
+      logPath = findNested(eventDir, logName);
+      if (logPath == null) {
+        throw new IllegalArgumentException("Log not found: " + eventName + "/" + logName);
+      }
+    }
+    if (rejectExcluded && isExcluded(logPath)) {
+      throw new IllegalArgumentException("Log excluded: " + logName);
+    }
+    return logPath;
   }
 
   private List<Path> findLogs(Path eventDir) throws IOException {

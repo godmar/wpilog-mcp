@@ -53,6 +53,8 @@ public class CurrentAnalyzer {
   private static final String TURN_AMP_SUFFIX = "turncurrentamps";
   private static final String SUPPLY_SUFFIX = "supplycurrentamps";
 
+  private enum PairRole { LEAD, FOLLOWER, NONE }
+
   // ======================================================================
   // Public entry points
   // ======================================================================
@@ -91,11 +93,12 @@ public class CurrentAnalyzer {
           "Swerve " + module.label(),
           module.prefix() + "/(computed)",
           "swerve",
-          stats, series, smoothedSeries));
+          stats, series, smoothedSeries, List.of()));
       matchSampleLists.add(inMatch);
     }
 
     // --- Direct supplyCurrentAmps entries ---
+    var directCandidates = new ArrayList<DirectCandidate>();
     for (var name : log.entries().keySet()) {
       String lower = name.toLowerCase();
       if (!lower.endsWith(SUPPLY_SUFFIX)) continue;
@@ -110,17 +113,12 @@ public class CurrentAnalyzer {
         samples.add(new Sample(tv.timestamp(), v));
       }
       if (samples.isEmpty()) continue;
-      var inMatch = filterToMatch(samples, phases);
-      var stats = stats(inMatch);
-      JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
-      JsonArray smoothedSeries = includeSeries ? smoothedSeries(samples) : null;
-      subsystems.add(new Subsystem(
-          friendlyName(name),
-          name,
-          "direct",
-          stats, series, smoothedSeries));
-      matchSampleLists.add(inMatch);
+      String friendly = friendlyName(name);
+      var pair = leadFollowerPair(friendly);
+      directCandidates.add(new DirectCandidate(
+          friendly, name, pair.label(), pair.role(), samples));
     }
+    addDirectSubsystems(directCandidates, phases, includeSeries, subsystems, matchSampleLists);
 
     // Build the instantaneous total-current time series by aligning every
     // subsystem onto a common grid (the union of their timestamps) with
@@ -151,6 +149,72 @@ public class CurrentAnalyzer {
         totalStats.mean(), totalStats.peak(), totalStats.p90(),
         Collections.unmodifiableList(subsystems), totalSeries, totalSmoothedSeries);
     return new CurrentDetail(summary);
+  }
+
+  private static void addDirectSubsystems(
+      List<DirectCandidate> candidates,
+      MatchPhases phases,
+      boolean includeSeries,
+      List<Subsystem> subsystems,
+      List<List<Sample>> matchSampleLists) {
+    var byPairLabel = new LinkedHashMap<String, List<DirectCandidate>>();
+    for (var c : candidates) {
+      if (c.role() == PairRole.NONE) continue;
+      byPairLabel.computeIfAbsent(c.pairLabel(), k -> new ArrayList<>()).add(c);
+    }
+
+    var consumed = new java.util.HashSet<DirectCandidate>();
+    for (var group : byPairLabel.values()) {
+      if (group.size() != 2) continue;
+      DirectCandidate lead = null;
+      DirectCandidate follower = null;
+      for (var c : group) {
+        if (c.role() == PairRole.LEAD) lead = c;
+        else if (c.role() == PairRole.FOLLOWER) follower = c;
+      }
+      if (lead == null || follower == null) continue;
+
+      var combined = computeAlignedTotal(List.of(lead.samples(), follower.samples()));
+      var components = List.of(
+          new Component(lead.name(), lead.entry(), stats(filterToMatch(lead.samples(), phases))),
+          new Component(follower.name(), follower.entry(), stats(filterToMatch(follower.samples(), phases))));
+      addDirectSubsystem(
+          lead.pairLabel(),
+          lead.entry() + " + " + follower.entry(),
+          "combined",
+          combined,
+          components,
+          phases,
+          includeSeries,
+          subsystems,
+          matchSampleLists);
+      consumed.add(lead);
+      consumed.add(follower);
+    }
+
+    for (var c : candidates) {
+      if (consumed.contains(c)) continue;
+      addDirectSubsystem(c.name(), c.entry(), "direct", c.samples(), List.of(), phases, includeSeries,
+          subsystems, matchSampleLists);
+    }
+  }
+
+  private static void addDirectSubsystem(
+      String name,
+      String entry,
+      String source,
+      List<Sample> samples,
+      List<Component> components,
+      MatchPhases phases,
+      boolean includeSeries,
+      List<Subsystem> subsystems,
+      List<List<Sample>> matchSampleLists) {
+    var inMatch = filterToMatch(samples, phases);
+    var stats = stats(inMatch);
+    JsonArray series = includeSeries ? downsampleSamples(samples, TIME_SERIES_MAX_POINTS) : null;
+    JsonArray smoothedSeries = includeSeries ? smoothedSeries(samples) : null;
+    subsystems.add(new Subsystem(name, entry, source, stats, series, smoothedSeries, components));
+    matchSampleLists.add(inMatch);
   }
 
   /**
@@ -532,6 +596,54 @@ public class CurrentAnalyzer {
   // Helpers (duplicated with BatteryAnalyzer to keep packages independent)
   // ======================================================================
 
+  private record DirectCandidate(
+      String name, String entry, String pairLabel, PairRole role, List<Sample> samples) {}
+
+  private record LeadFollowerPair(String label, PairRole role) {}
+
+  private static LeadFollowerPair leadFollowerPair(String name) {
+    var normalizedWords = new ArrayList<String>();
+    PairRole role = PairRole.NONE;
+    for (String word : name.split("\\s+")) {
+      if (word.isBlank()) continue;
+
+      String withoutLead = removeRoleMarker(word, "Lead");
+      String withoutFollower = removeRoleMarker(word, "Follower");
+      boolean lead = !withoutLead.equals(word);
+      boolean follower = !withoutFollower.equals(word);
+      if (lead && follower) {
+        return new LeadFollowerPair(name, PairRole.NONE);
+      }
+      if (lead) {
+        if (role == PairRole.FOLLOWER) return new LeadFollowerPair(name, PairRole.NONE);
+        role = PairRole.LEAD;
+        word = withoutLead;
+      } else if (follower) {
+        if (role == PairRole.LEAD) return new LeadFollowerPair(name, PairRole.NONE);
+        role = PairRole.FOLLOWER;
+        word = withoutFollower;
+      }
+
+      if (!word.isBlank()) normalizedWords.add(word);
+    }
+    if (role == PairRole.NONE || normalizedWords.isEmpty()) {
+      return new LeadFollowerPair(name, PairRole.NONE);
+    }
+    return new LeadFollowerPair(String.join(" ", normalizedWords), role);
+  }
+
+  private static String removeRoleMarker(String word, String marker) {
+    if (word.equals(marker)) return "";
+    if (word.startsWith(marker) && word.length() > marker.length()
+        && Character.isUpperCase(word.charAt(marker.length()))) {
+      return word.substring(marker.length());
+    }
+    if (word.endsWith(marker) && word.length() > marker.length()) {
+      return word.substring(0, word.length() - marker.length());
+    }
+    return word;
+  }
+
   private String findBatteryEntry(LogData log) {
     var names = log.entries().keySet();
     for (String pattern : List.of(
@@ -630,19 +742,21 @@ public class CurrentAnalyzer {
   static final class Subsystem {
     final String name;
     final String entry;
-    final String source; // "direct" or "swerve"
+    final String source; // "direct", "combined", or "swerve"
     final Stats stats;
     final JsonArray series; // nullable
     final JsonArray smoothedSeries; // nullable — 1 s trailing mean overlay
+    final List<Component> components;
 
     Subsystem(String name, String entry, String source, Stats stats,
-              JsonArray series, JsonArray smoothedSeries) {
+              JsonArray series, JsonArray smoothedSeries, List<Component> components) {
       this.name = name;
       this.entry = entry;
       this.source = source;
       this.stats = stats;
       this.series = series;
       this.smoothedSeries = smoothedSeries;
+      this.components = components;
     }
 
     JsonObject toJson() {
@@ -653,6 +767,22 @@ public class CurrentAnalyzer {
       o.add("stats", stats.toJson());
       if (series != null) o.add("series", series);
       if (smoothedSeries != null) o.add("smoothedSeries", smoothedSeries);
+      if (!components.isEmpty()) {
+        var arr = new JsonArray();
+        for (var c : components) arr.add(c.toJson());
+        o.add("components", arr);
+      }
+      return o;
+    }
+  }
+
+  private record Component(String name, String entry, Stats stats) {
+    JsonObject toJson() {
+      var o = new JsonObject();
+      o.addProperty("name", name);
+      o.addProperty("entry", entry);
+      o.addProperty("source", "direct");
+      o.add("stats", stats.toJson());
       return o;
     }
   }

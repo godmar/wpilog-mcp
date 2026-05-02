@@ -219,8 +219,13 @@ public class StatsServer {
   private void handleLogDetail(HttpExchange exchange, String event, String logName)
       throws IOException {
     try {
+      String etag = eventService.logDetailEtag(event, logName);
+      if (etagMatches(exchange.getRequestHeaders().getFirst("If-None-Match"), etag)) {
+        sendNotModified(exchange, etag);
+        return;
+      }
       var detail = eventService.detailLog(event, logName);
-      sendJson(exchange, 200, detail);
+      sendJson(exchange, 200, detail, "private, no-cache", etag);
     } catch (IllegalArgumentException e) {
       sendText(exchange, 404, e.getMessage());
     } catch (Exception e) {
@@ -329,9 +334,18 @@ public class StatsServer {
   // ======================================================================
 
   private void sendJson(HttpExchange exchange, int status, Object body) throws IOException {
+    sendJson(exchange, status, body, "no-store", null);
+  }
+
+  private void sendJson(
+      HttpExchange exchange, int status, Object body, String cacheControl, String etag)
+      throws IOException {
     byte[] bytes = gson.toJson(body).getBytes(StandardCharsets.UTF_8);
     exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-    exchange.getResponseHeaders().set("Cache-Control", "no-store");
+    exchange.getResponseHeaders().set("Cache-Control", cacheControl);
+    if (etag != null) {
+      exchange.getResponseHeaders().set("ETag", etag);
+    }
     exchange.sendResponseHeaders(status, bytes.length);
     try (OutputStream os = exchange.getResponseBody()) {
       os.write(bytes);
@@ -345,6 +359,21 @@ public class StatsServer {
     try (OutputStream os = exchange.getResponseBody()) {
       os.write(bytes);
     }
+  }
+
+  private void sendNotModified(HttpExchange exchange, String etag) throws IOException {
+    exchange.getResponseHeaders().set("Cache-Control", "private, no-cache");
+    exchange.getResponseHeaders().set("ETag", etag);
+    exchange.sendResponseHeaders(304, -1);
+  }
+
+  private static boolean etagMatches(String ifNoneMatch, String etag) {
+    if (ifNoneMatch == null || ifNoneMatch.isBlank()) return false;
+    for (String part : ifNoneMatch.split(",")) {
+      String candidate = part.trim();
+      if (candidate.equals("*") || candidate.equals(etag)) return true;
+    }
+    return false;
   }
 
   private static String decode(String s) {

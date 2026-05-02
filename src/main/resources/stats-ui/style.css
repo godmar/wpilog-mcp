@@ -168,6 +168,19 @@ table td.num {
 }
 .pill.swerve { background: #1e3a8a; color: #bfdbfe; }
 .pill.direct { background: #064e3b; color: #a7f3d0; }
+.pill.combined { background: #4c1d95; color: #ddd6fe; }
+
+tr.component-row td {
+  color: #94a3b8;
+  background: #111827;
+}
+tr.component-row td:first-child {
+  padding-left: 1.6rem;
+}
+tr.component-row td:first-child::before {
+  content: "-> ";
+  color: #64748b;
+}
 
 /* TBA match result styling */
 td.tba-win { color: #4ade80; }

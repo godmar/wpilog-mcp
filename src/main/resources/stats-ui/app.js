@@ -299,6 +299,7 @@
       loadLogTbaAsync(eventName, logName, tbaSlot, phases);
 
       const battery = data.battery || {};
+      const loopTiming = data.loopTiming || {};
       const current = data.current || {};
       const vision = data.vision || {};
 
@@ -491,19 +492,10 @@
         table.appendChild(thead);
         const tbody = el("tbody");
         for (const s of current.subsystems) {
-          const tr = el("tr");
-          tr.appendChild(el("td", {}, s.name));
-          const srcCell = el("td");
-          const pill = el("span", { class: "pill " + (s.source === "swerve" ? "swerve" : "direct") },
-            s.source === "swerve" ? "computed" : "direct");
-          srcCell.appendChild(pill);
-          tr.appendChild(srcCell);
-          tr.appendChild(el("td", { class: "num" }, fmt(s.stats.mean)));
-          tr.appendChild(el("td", { class: "num" }, fmt(s.stats.rms)));
-          tr.appendChild(el("td", { class: "num" }, fmt(s.stats.p90)));
-          tr.appendChild(el("td", { class: "num" }, fmt(s.stats.peak)));
-          tr.appendChild(el("td", { class: "num" }, fmtInt(s.stats.sampleCount)));
-          tbody.appendChild(tr);
+          appendSubsystemStatsRow(tbody, s);
+          for (const c of (s.components || [])) {
+            appendSubsystemStatsRow(tbody, c, "component-row");
+          }
         }
         table.appendChild(tbody);
         appEl.appendChild(table);
@@ -519,9 +511,94 @@
       }
 
       renderVisionSection(vision);
+      renderLoopTimingSection(loopTiming, phases);
     } catch (e) {
       showError(e);
     }
+  }
+
+  function currentSourceLabel(source) {
+    if (source === "swerve") return "computed";
+    if (source === "combined") return "combined";
+    return "direct";
+  }
+
+  function currentSourceClass(source) {
+    if (source === "swerve") return "swerve";
+    if (source === "combined") return "combined";
+    return "direct";
+  }
+
+  function appendSubsystemStatsRow(tbody, subsystem, rowClass = "") {
+    const tr = el("tr", rowClass ? { class: rowClass } : {});
+    tr.appendChild(el("td", {}, subsystem.name));
+    const srcCell = el("td");
+    srcCell.appendChild(el("span", { class: "pill " + currentSourceClass(subsystem.source) },
+      currentSourceLabel(subsystem.source)));
+    tr.appendChild(srcCell);
+    tr.appendChild(el("td", { class: "num" }, fmt(subsystem.stats.mean)));
+    tr.appendChild(el("td", { class: "num" }, fmt(subsystem.stats.rms)));
+    tr.appendChild(el("td", { class: "num" }, fmt(subsystem.stats.p90)));
+    tr.appendChild(el("td", { class: "num" }, fmt(subsystem.stats.peak)));
+    tr.appendChild(el("td", { class: "num" }, fmtInt(subsystem.stats.sampleCount)));
+    tbody.appendChild(tr);
+  }
+
+  function renderLoopTimingSection(loopTiming, phases) {
+    if (!loopTiming.available || !loopTiming.series || loopTiming.series.length === 0) return;
+
+    const loopStrip = el("div", { class: "stats-strip" });
+    loopStrip.appendChild(stat("Mean loop", `${fmt(loopTiming.meanMs)} ms`));
+    loopStrip.appendChild(stat("P95 loop", `${fmt(loopTiming.p95Ms)} ms`,
+      loopTiming.p95Ms > loopTiming.thresholdMs ? "warn" : ""));
+    loopStrip.appendChild(stat("P99 loop", `${fmt(loopTiming.p99Ms)} ms`,
+      loopTiming.p99Ms > loopTiming.thresholdMs ? "warn" : ""));
+    loopStrip.appendChild(stat("Max loop", `${fmt(loopTiming.maxMs)} ms`,
+      loopTiming.maxMs > loopTiming.thresholdMs * 2 ? "critical"
+        : loopTiming.maxMs > loopTiming.thresholdMs ? "warn" : ""));
+    loopStrip.appendChild(stat(`Loops > ${fmt(loopTiming.thresholdMs, 0)} ms`,
+      fmtInt(loopTiming.violationCount),
+      loopTiming.violationCount > 0 ? "warn" : ""));
+    appEl.appendChild(loopStrip);
+
+    appEl.appendChild(el("h3", {}, `Robot loop length — ${loopTiming.entry}`));
+    const loopBox = el("div", { class: "chart-container" });
+    const loopCanvas = el("canvas");
+    loopBox.appendChild(loopCanvas);
+    appEl.appendChild(loopBox);
+    const loopDatasets = [{
+      label: "Loop length (ms)",
+      data: loopTiming.series.map(([t, v]) => ({ x: t, y: v })),
+      borderColor: "rgba(34, 211, 238, 0.85)",
+      backgroundColor: "rgba(34, 211, 238, 0.10)",
+      borderWidth: 1,
+      pointRadius: 0,
+      tension: 0,
+      fill: true,
+      order: 2,
+    }];
+    if (loopTiming.thresholdMs != null) {
+      loopDatasets.push({
+        label: `${fmt(loopTiming.thresholdMs, 0)} ms target`,
+        data: [
+          { x: loopTiming.series[0][0], y: loopTiming.thresholdMs },
+          { x: loopTiming.series[loopTiming.series.length - 1][0], y: loopTiming.thresholdMs }
+        ],
+        borderColor: "rgba(239, 68, 68, 0.8)",
+        borderDash: [6, 4],
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        order: 1,
+      });
+    }
+    const loopChart = new Chart(loopCanvas, {
+      type: "line",
+      data: { datasets: loopDatasets },
+      options: timeSeriesOptions("Loop length (ms)", phases),
+    });
+    activeCharts.push(loopChart);
+    timeSeriesCharts.push(loopChart);
   }
 
   // Renders a per-camera vision-quality table from the photonvision-style
