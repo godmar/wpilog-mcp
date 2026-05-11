@@ -87,6 +87,72 @@
     return resp.json();
   }
 
+  // Streams the response body so we can report progress. Falls back to
+  // bytes-loaded display when Content-Length is missing (e.g. chunked).
+  async function fetchJsonWithProgress(url, onProgress) {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+    }
+    const lenHeader = resp.headers.get("Content-Length");
+    const total = lenHeader ? parseInt(lenHeader, 10) : 0;
+    if (!resp.body || !resp.body.getReader) {
+      // No streaming support — just read the whole thing.
+      const txt = await resp.text();
+      if (onProgress) onProgress(txt.length, txt.length);
+      return JSON.parse(txt);
+    }
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (onProgress) onProgress(received, total);
+    }
+    let offset = 0;
+    const merged = new Uint8Array(received);
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const text = new TextDecoder("utf-8").decode(merged);
+    return JSON.parse(text);
+  }
+
+  function fmtBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  }
+
+  function loadingWithProgress(msg) {
+    destroyCharts();
+    appEl.innerHTML = "";
+    const text = el("p", { class: "loading" }, msg);
+    const barWrap = el("div", { class: "progress-wrap" });
+    const bar = el("div", { class: "progress-bar" });
+    barWrap.appendChild(bar);
+    const status = el("p", { class: "progress-status" }, "starting…");
+    appEl.appendChild(text);
+    appEl.appendChild(barWrap);
+    appEl.appendChild(status);
+    return function update(received, total) {
+      if (total > 0) {
+        const pct = Math.min(100, Math.round((received / total) * 100));
+        bar.style.width = `${pct}%`;
+        status.textContent = `${pct}% — ${fmtBytes(received)} of ${fmtBytes(total)}`;
+      } else {
+        bar.style.width = "100%";
+        bar.classList.add("indeterminate");
+        status.textContent = `${fmtBytes(received)} loaded`;
+      }
+    };
+  }
+
   function setCrumbs(parts) {
     crumbsEl.innerHTML = "";
     parts.forEach((part, i) => {
@@ -263,15 +329,16 @@
   }
 
   async function renderLog(eventName, logName) {
-    loading(`Analyzing ${eventName}/${logName}…`);
+    const onProgress = loadingWithProgress(`Analyzing ${eventName}/${logName}…`);
     setCrumbs([
       { label: "Events", href: `${BASE}/` },
       { label: eventName, href: `${BASE}/${encodeURIComponent(eventName)}/` },
       { label: logName },
     ]);
     try {
-      const data = await fetchJson(
-        `${BASE}/api/logs/${encodeURIComponent(eventName)}/${encodeURIComponent(logName)}`);
+      const data = await fetchJsonWithProgress(
+        `${BASE}/api/logs/${encodeURIComponent(eventName)}/${encodeURIComponent(logName)}`,
+        onProgress);
       appEl.innerHTML = "";
       appEl.appendChild(el("h2", {}, data.displayName || logName));
       const metaParts = [
